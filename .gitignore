@@ -1,6 +1,7 @@
 *
 !.gitignore
 !README.md
+!README_zh.md
 !.env.example
 !pyproject.toml
 !uv.lock

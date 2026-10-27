@@ -1,105 +1,107 @@
 # MemBridge
 
 > **Standardized C/S Evaluation Middleware & Gateway for AI Agent Long-Term Memory Systems**
+>
+> [English](README.md) | [简体中文](README_zh.md)
 
-评测端统一答题和打分，记忆系统只交回记忆。这样比较的是记忆本身，而不是各家论文自己的答题模型、提示词和指标。
+MemBridge unifies answer generation and evaluation scoring, requiring the memory system under test only to return raw memories. This isolates and benchmarks memory retention and retrieval quality directly—decoupled from proprietary answering models, custom prompts, or non-standardized scoring metrics across academic literature.
 
-评测中间层与被测记忆系统采用 **C/S 微服务解耦架构**：
-评测端作为客户端只负责发送评测流量（调度 Ingest、Retrieve 并统一答题打分），被测记忆系统作为独立 HTTP Server 运行（实现 `/ingest` 与 `/retrieve` 两个核心端点）。
-
----
-
-## 系统整体架构 (System Architecture)
-
-![MemBridge 整体架构图](assets/architecture.png)
-
-系统在逻辑上划分为三个彻底解耦的层次：
-
-1. **评测基准数据层 (Data & Benchmark Layer)**：覆盖 LoCoMo、LongMemEval、BEAM、MemBench 与 HaluMem 五大长对话评测基准。通过适配器统一加载为 `Conversation`、`Session`、`Turn` 与 `Question` 标准实体，并自动收敛至 6 类核心能力图谱。
-2. **MemBridge 评测中间层 (Evaluation Middleware)**：作为评测主控客户端，调度会话级并发写入与检索；检索完成后，将服务端返回的文本上下文安全注入统一 Prompt 模板，调用 Answer LLM 生成作答，并经由标准评测器（`ExactMatch` / `F1` / `LLMJudge`）进行客观与语义打分。
-3. **独立 Memory Server 被测服务层 (Isolated Memory Service)**：被测记忆系统作为独立 HTTP 微服务或 Docker 容器运行。评测端视其为**完全黑盒**，仅通过 `POST /ingest`（会话级写入）与 `POST /retrieve`（问题级检索）两个标准端点通信。记忆系统内部采用何种存储与演化策略（无论是向量检索、知识图谱、分层递归摘要、键值索引还是混合架构），评测端均不作任何假设与侵入。
+MemBridge and the external memory system operate in a **decoupled Client/Server (C/S) microservice architecture**:
+The evaluation client acts as an orchestrator sending benchmark workloads (managing `Ingest` and `Retrieve`, and scoring answers), while the memory system under test runs as an independent HTTP service or Docker container exposing two standardized endpoints (`/ingest` and `/retrieve`).
 
 ---
 
-## 评测题与 6 类能力图谱
+## System Architecture
 
-五个基准的原题按「做对时该回答什么」收成 6 类能力。总分和这 6 类使用同一批题目，对不上的原题在加载适配时自动过滤剔除。
+![MemBridge Architecture](assets/architecture.png)
 
-| 类型 | 做对时该回答什么 | 收进来的代表性原题 |
+The system is logically partitioned into three decoupled tiers:
+
+1. **Benchmark & Data Tier**: Supports five major long-dialogue benchmarks: LoCoMo, LongMemEval, BEAM, MemBench, and HaluMem. Raw datasets are parsed through benchmark adapters into unified domain entities (`Conversation`, `Session`, `Turn`, and `Question`) and automatically filtered into a standardized 6-capability taxonomy.
+2. **MemBridge Evaluation Middleware**: Operates as the evaluation controller, orchestrating session-level concurrent ingestion and retrieval. Upon retrieval, retrieved memories are safely formatted into standardized prompt templates to generate answers via an Answer LLM, followed by objective and semantic scoring (`ExactMatch`, `F1`, and `LLMJudge`).
+3. **Isolated Memory Service (System Under Test)**: Runs as an independent HTTP microservice or Docker container. Treated by MemBridge as a **complete black box** communicating exclusively through `POST /ingest` (session-level writing) and `POST /retrieve` (query-level retrieval). MemBridge makes no assumptions about internal architectures—whether vector databases, knowledge graphs, hierarchical recursive summarization, key-value stores, or hybrid pipelines.
+
+---
+
+## Benchmark Cohort & 6-Capability Taxonomy
+
+Original benchmark questions are standardized by **what a correct answer requires**, converging across all five datasets into 6 core capabilities. Total scores and capability breakdowns evaluate the exact same cohort, automatically filtering unaligned questions during loading.
+
+| Capability | What a Correct Answer Requires | Representative Benchmark Tasks |
 | :--- | :--- | :--- |
-| **事实回忆** | 把已经说过的内容准确说出来 | LoCoMo 单跳；LongMemEval 用户/助手事实；BEAM 事实抽取；MemBench 基础识别；HaluMem 事实回忆 |
-| **多证据综合** | 把好几处分散说过的内容拼接推理 | LoCoMo 多跳；LongMemEval 跨会话推理；BEAM 多跳；MemBench 综合筛选与比较；HaluMem 多跳 |
-| **时间与顺序** | 用精确日期或相对先后顺序作答 | LoCoMo 时间题；LongMemEval 时间推理；BEAM 时间间隔与事件排序 |
-| **记忆更新** | 只回答更新后的当前有效事实 | LongMemEval、BEAM、MemBench、HaluMem 的状态与事实动态更新题 |
-| **拒答** | 明确识别未提及内容并礼貌拒答 | LongMemEval 拒答题；BEAM 拒答量规；HaluMem 记忆边界检验题 |
-| **个性化** | 偏好已经明确提及，回答必须遵循 | LongMemEval 偏好题；BEAM 偏好遵循 |
+| **Factual Recall** | Accurately recall previously stated explicit facts | LoCoMo single-hop; LongMemEval user/assistant facts; BEAM fact extraction; MemBench basic identification; HaluMem factual recall |
+| **Multi-Hop Synthesis** | Synthesize and reason over multiple disjoint evidence spans | LoCoMo multi-hop; LongMemEval cross-session reasoning; BEAM multi-hop; MemBench comparative filtering; HaluMem multi-hop |
+| **Temporal & Ordering** | Answer using precise dates or relative chronological sequence | LoCoMo temporal queries; LongMemEval temporal reasoning; BEAM time intervals and event ordering |
+| **Memory Update** | Answer strictly with the latest valid fact after dynamic updates | State and fact update questions across LongMemEval, BEAM, MemBench, and HaluMem |
+| **Refusal & Boundary** | Correctly identify unmentioned topics and politely refuse | LongMemEval refusal queries; BEAM refusal rubric; HaluMem memory boundary probes |
+| **Personalization** | Strictly adhere to previously established user preferences | LongMemEval preference queries; BEAM preference adherence |
 
-> **未纳入这 6 类的边缘题型**：包括 LoCoMo 对抗题与开放域常识题，MemBench 没说破的隐含情绪与带噪问题，BEAM 内部矛盾与指令遵循，HaluMem 错误前提纠正与新情境应用。
+> **Excluded Edge Cases**: Adversarial and open-domain common-sense questions (LoCoMo), unstated implicit emotions and noisy questions (MemBench), internal contradictions and general instruction following (BEAM), premise correction and novel transfer scenarios (HaluMem).
 
-**统一评测裁决矩阵**：
-评测端提供三个高内聚通用评测器：**字符串精确匹配 (`ExactMatch`)**、**Token 级重叠度 (`F1`)** 以及基于强类型 Pydantic 契约的 **`LLMJudge` 裁判**。当遇到关键背景信息缺失或时间基准不足时，裁判自动标记 `UNDECIDABLE` 拒判并路由转人工复核，杜绝二元猜题误判。
+**Unified Evaluation Judge Matrix**:
+MemBridge provides three cohesive evaluators: **Exact String Match (`ExactMatch`)**, **Token-Level Overlap (`F1`)**, and a typed Pydantic dual-schema **`LLMJudge`**. When essential context or temporal anchors are missing, the judge automatically outputs `UNDECIDABLE`, routing uncertain cases to manual review to prevent binary hallucination.
 
 ---
 
-## 目录结构与关键模块职责
+## Directory Structure & Key Modules
 
 ```text
 ├── configs/
-│   └── application.yaml                # 统一配置中心（LLM 客户端超参与动态 Prompt 矩阵）
-├── assets/                             # 仓库静态资产与学术架构示意图
-├── src/memory_benchmark/               # 评测中间层核心源码
-│   ├── benchmark_adapters/             # 5 大基准加载与 6 类题型过滤适配器 (LoCoMo / LongMemEval 等)
-│   ├── core/                           # 核心领域实体、中间层协议 (MemoryProvider) 与安全变量格式化引擎
-│   ├── readers/                        # 统一回答生成器 (FrameworkAnswerReader 拼接记忆与生成回答)
-│   ├── evaluators/                     # 通用评估器 (ExactMatch / F1 / 支持拒判转人工的双模式 LLM-Judge)
-│   ├── runners/                        # 执行器 (prediction.py 并发预测与 evaluation.py 离线解耦打分)
-│   ├── storage/                        # 评测实验产物管理 (JSON Lines 读写与原子落地)
-│   ├── utils/                          # 通用工具 (线程安全运行日志记录器等)
-│   └── __main__.py                     # 极简 CLI 命令行入口 (run / ingest / query / eval)
-├── pyproject.toml                      # 项目元数据与评测必要依赖规范
-├── uv.lock                             # 确定性依赖版本锁定文件
-├── .env.example                        # 环境变量模板 (API_KEY / BASE_URL / MODEL_NAME)
-└── .gitignore                          # 严格白名单过滤规则
+│   └── application.yaml                # Unified configuration (LLM hyperparameters & dynamic prompt matrix)
+├── assets/                             # Repository static assets & academic architecture diagram
+├── src/memory_benchmark/               # Core middleware source code
+│   ├── benchmark_adapters/             # Benchmark loaders & 6-capability cohort filters (LoCoMo, LongMemEval, etc.)
+│   ├── core/                           # Domain entities, provider protocol (MemoryProvider), & safe string formatter
+│   ├── readers/                        # Unified answer generation (FrameworkAnswerReader injecting memory context)
+│   ├── evaluators/                     # Standardized evaluators (ExactMatch, Token F1, dual-mode LLM Judge)
+│   ├── runners/                        # Execution runners (concurrent prediction.py & offline evaluation.py)
+│   ├── storage/                        # Experiment artifact persistence (atomic JSON Lines I/O)
+│   ├── utils/                          # Common utilities (thread-safe run loggers, etc.)
+│   └── __main__.py                     # Minimal CLI entrypoints (run, ingest, query, eval)
+├── pyproject.toml                      # Project metadata & evaluation dependencies
+├── uv.lock                             # Deterministic dependency lockfile
+├── .env.example                        # Environment variable template (API_KEY, BASE_URL, MODEL_NAME)
+└── .gitignore                          # Strict whitelist filtering rules
 ```
 
-### 关键目录与模块职责
+### Module Responsibilities
 
-- [`configs/application.yaml`](configs/application.yaml)：全局基准与差异化覆盖配置中心。定义 `llm.answer` 与 `llm.judge` 默认模型参数，并配置各大 Benchmark 细分题型的定制化 System/User 提示词。
-- [`src/memory_benchmark/benchmark_adapters/`](src/memory_benchmark/benchmark_adapters/)：统一数据接口。负责解析原始对话为 `Conversation -> Session -> Turn`，只保留映射进 6 类的有效题，并剥离私有参考答案。
-- [`src/memory_benchmark/core/`](src/memory_benchmark/core/)：系统核心抽象层。提供泛型响应封装 `Result[T]`、极简双方法客户端协议 [`HttpMemoryProvider`](src/memory_benchmark/core/provider_protocol.py)，以及免疫 JSON 花括号冲突的安全提示词格式化引擎。
-- [`src/memory_benchmark/readers/`](src/memory_benchmark/readers/)：统一答题生成层。将被测记忆系统返回的纯文本 `formatted_memory` 拼入提示词，使用统一配置的 Answer LLM 回答问题。
-- [`src/memory_benchmark/evaluators/`](src/memory_benchmark/evaluators/)：统一指标打分层。包括字符串精确匹配 `ExactMatch`、Token 级重叠度 `F1` 以及强类型 Pydantic 双模式的 `LLMJudgeEvaluator`。
-- [`src/memory_benchmark/runners/`](src/memory_benchmark/runners/)：流水线编排调度层。以对话（Conversation）为粒度进行多线程并发执行，并按原始索引严格确定性归并生成产物。
+- [`configs/application.yaml`](configs/application.yaml): Global benchmark configuration. Configures default parameters for `llm.answer` and `llm.judge`, as well as task-specific system/user prompts across benchmark question types.
+- [`src/memory_benchmark/benchmark_adapters/`](src/memory_benchmark/benchmark_adapters/): Unified data interface. Parses raw datasets into `Conversation -> Session -> Turn`, retains only the 6-capability cohort, and strips ground-truth answers from memory ingestion.
+- [`src/memory_benchmark/core/`](src/memory_benchmark/core/): Core abstractions. Implements generic `Result[T]` response envelope, minimal two-method client protocol [`HttpMemoryProvider`](src/memory_benchmark/core/provider_protocol.py), and template formatting safe from JSON brace conflicts.
+- [`src/memory_benchmark/readers/`](src/memory_benchmark/readers/): Unified answer generation. Injects raw retrieved `formatted_memory` into the configured prompt template and generates answers using the Answer LLM.
+- [`src/memory_benchmark/evaluators/`](src/memory_benchmark/evaluators/): Standardized evaluation metrics. Implements string `ExactMatch`, token-level `F1`, and schema-enforced `LLMJudgeEvaluator`.
+- [`src/memory_benchmark/runners/`](src/memory_benchmark/runners/): Pipeline orchestrators. Manages multi-threaded concurrent execution partitioned by conversation, deterministically merging outputs by original index.
 
 ---
 
-## 记忆系统对接协议与接口实体规范 (C/S API Specification)
+## C/S API Specification & Interface Protocols
 
-被测记忆服务（Method Server / Docker 容器）只需暴露以下两个标准 HTTP POST 端点，并统一采用 `Result[T]` JSON 信封响应：
+The memory server under test (Method Server / Docker container) only needs to expose two standard HTTP POST endpoints, returning standard `Result[T]` JSON envelopes:
 
-### 1. 记忆写入端点 (`POST /ingest`)
+### 1. Memory Ingestion (`POST /ingest`)
 
-以「单次会话（Session，包含该会话的多轮发言）」为标准粒度递交记忆。
+Delivers memories at the granularity of a **Session** (a single interactive episode containing multiple conversational turns).
 
-- **请求实体 (`IngestRequest`)**：
-  - `isolation_key` (`str`，必填)：数据隔离分区键（格式为 `{run_id}_{conversation_id}`），不同对话严格隔离，杜绝数据串扰；
-  - `session` (`Session`，必填)：当前会话数据实体：
-    - `session_id` (`str`)：当前会话唯一标识符；
-    - `session_time` (`str | null`)：当前会话发生的时间锚点（如 `"2023-05-10 14:30:00"`）；
-    - `turns` (`list[Turn]`)：会话轮次列表：
-      - `turn_id` (`str`)：单轮发言 ID；
-      - `speaker` (`str`)：发言人标识。**取值有两种谱系**：
-        1. **标准角色**（LongMemEval / BEAM / HaluMem / MemBench）：`"user"`（用户）与 `"assistant"` / `"agent"`（助手）；
-        2. **真实角色姓名**（LoCoMo）：具体的对话角色人名（如 `"Alice"`, `"Bob"`, `"Caroline"`）；
-        *建议*：被测系统在抽取知识实体时，可直接以 `speaker` 作为主语/来源标签。
-      - `turn_time` (`str | null`)：单轮发言具体时间戳（部分基准如 BEAM/HaluMem 细化到了单轮，若无则为 `null`）；
-      - `content` (`str`)：发言文本内容（多模态视觉描述已标准化内联为文本描述）；
-  - `metadata` (`dict`)：调度元数据，如 `{"is_last_session": true}` 告知会话收口。
+- **Request Entity (`IngestRequest`)**:
+  - `isolation_key` (`str`, required): Data partition key (`{run_id}_{conversation_id}`). Ensures complete isolation between conversations;
+  - `session` (`Session`, required): Current session data payload:
+    - `session_id` (`str`): Unique session identifier;
+    - `session_time` (`str | null`): Session timestamp anchor (e.g., `"2023-05-10 14:30:00"`);
+    - `turns` (`list[Turn]`): List of conversational turns:
+      - `turn_id` (`str`): Turn identifier;
+      - `speaker` (`str`): Speaker identifier. Supports two conventions:
+        1. **Standard roles** (LongMemEval / BEAM / HaluMem / MemBench): `"user"` and `"assistant"` / `"agent"`;
+        2. **Named personas** (LoCoMo): Specific characters (e.g., `"Alice"`, `"Bob"`, `"Caroline"`);
+        *Recommendation*: Memory systems can directly use `speaker` as entity subjects or source tags.
+      - `turn_time` (`str | null`): Specific turn timestamp (when available in BEAM/HaluMem, otherwise `null`);
+      - `content` (`str`): Utterance text (multimodal image descriptions are standardized as inline text descriptions);
+  - `metadata` (`dict`): Scheduling metadata, such as `{"is_last_session": true}` marking conversation completion.
 
-> **时间层级降级策略（Temporal Fallback）**：
-> 记忆系统在构建带时间戳的记忆时，推荐采用分层继承规则：**优先使用 `turn.turn_time`；若为 `null`，则自动降级继承会话级的 `session.session_time`**。这样无论对接哪个基准，都能保证时序证据链完整。
+> **Temporal Fallback Strategy**:
+> When constructing timestamped memories, systems should follow hierarchical inheritance: **Prefer `turn.turn_time`; if `null`, automatically inherit the session-level `session.session_time`**. This guarantees a complete chronological chain of evidence across all benchmarks.
 
-**请求体 JSON 范例**：
+**Request JSON Example**:
 ```json
 {
   "isolation_key": "locomo_run1_conv01",
@@ -127,7 +129,7 @@
 }
 ```
 
-- **响应实体 (`Result[None]`)**：
+- **Response Entity (`Result[None]`)**:
 ```json
 {
   "code": 200,
@@ -139,18 +141,18 @@
 
 ---
 
-### 2. 记忆检索端点 (`POST /retrieve`)
+### 2. Memory Retrieval (`POST /retrieve`)
 
-根据考题文本和隔离键取回与问题相关的记忆，只返回纯文本 `formatted_memory`，不返回答案。
+Retrieves relevant memories based on the test query and isolation key. Returns plain text `formatted_memory` without answering the question.
 
-- **请求实体 (`RetrieveRequest`)**：
-  - `isolation_key` (`str`，必填)：必须与写入时的数据隔离键严格一致；
-  - `query` (`str`，必填)：需要被回答的问题文本；
-  - `question_time` (`str | null`)：提问时间锚点（辅助记忆系统进行相对时间推理）；
-  - `question_id` (`str | null`)：考题唯一标识；
-  - `metadata` (`dict`)：可选检索扩展信息。
+- **Request Entity (`RetrieveRequest`)**:
+  - `isolation_key` (`str`, required): Must match the ingestion partition key;
+  - `query` (`str`, required): The question text to be answered;
+  - `question_time` (`str | null`): Timestamp anchor of the query (assists relative time reasoning);
+  - `question_id` (`str | null`): Unique test question identifier;
+  - `metadata` (`dict`): Optional retrieval metadata.
 
-**请求体 JSON 范例**：
+**Request JSON Example**:
 ```json
 {
   "isolation_key": "locomo_run1_conv01",
@@ -161,7 +163,7 @@
 }
 ```
 
-- **响应实体 (`Result[RetrievePayload]`)**：
+- **Response Entity (`Result[RetrievePayload]`)**:
 ```json
 {
   "code": 200,
@@ -173,27 +175,27 @@
 }
 ```
 
-> **双轨延迟度量说明（Dual Latency Tracking）**：
-> - 响应体中的 `latency_ms` 为可选字段，代表 Memory Server 内部计算耗时；
-> - 评测框架在客户端始终通过高精度物理时钟 `time.perf_counter()` 自动测量端到端网络往返耗时（Wall-Clock Latency）；
-> - 若服务端在响应中返回了 `latency_ms`，评测框架会同时记录并在产物与摘要中展示两者，便于对比服务端内部处理耗时与网络开销。
+> **Dual Latency Tracking**:
+> - `latency_ms` in the response body is optional, representing internal server computation time;
+> - MemBridge continuously measures end-to-end network round-trip time (Wall-Clock Latency) on the client side using high-precision `time.perf_counter()`;
+> - If the server includes `latency_ms`, MemBridge records and reports both metrics, enabling clear comparison between server computation and network overhead.
 
 ---
 
-## 服务端多线程并发要求与处理指南 (Server-Side Concurrency)
+## Server-Side Concurrency & Engineering Guidelines
 
-评测框架客户端支持通过 `-w` / `--max-workers` 开启高并发评测（如 `-w 10`）。由于多线程是在客户端并发向外部 Memory Server 发起 HTTP 请求，**服务端必须具备相应的并发支撑与数据安全设计**：
+The MemBridge client supports multi-threaded concurrent evaluation via `-w` / `--max-workers` (e.g., `-w 10`). Because client workers concurrently send HTTP requests to the external Memory Server, **the server must implement adequate concurrency controls and data safety guards**:
 
 ```mermaid
 flowchart LR
-    subgraph Client["评测端 Client (并发 Workers)"]
-        W1["Worker 1 (对话 1)"]
-        W2["Worker 2 (对话 2)"]
+    subgraph Client["MemBridge Client (Concurrent Workers)"]
+        W1["Worker 1 (Conversation 1)"]
+        W2["Worker 2 (Conversation 2)"]
     end
-    subgraph Server["外部 Memory Server"]
-        ASGI["ASGI 异步网关 (Uvicorn / Gunicorn)"]
-        POOL["DB / 向量库连接池"]
-        LOCK["按 isolation_key 隔离存储<br/>(会话间并发，会话内严格保序)"]
+    subgraph Server["External Memory Server"]
+        ASGI["ASGI Async Gateway (Uvicorn / Gunicorn)"]
+        POOL["DB / Vector Connection Pool"]
+        LOCK["Partitioned by isolation_key<br/>(Concurrent conversations, in-order sessions)"]
     end
     W1 -->|"POST /ingest (Key 1)"| ASGI
     W2 -->|"POST /ingest (Key 2)"| ASGI
@@ -201,62 +203,62 @@ flowchart LR
     POOL --> LOCK
 ```
 
-### 1. 同一会话下的 Session 严格顺序传递保证（In-Order Delivery）
-同一个 `isolation_key`（即同一段长对话）下的所有 Session，评测端**严格按时间升序串行、同步递交**：
-- 只有当前一个 Session 的 HTTP 响应成功返回（`200 OK`）后，评测端才会发出下一个 Session 的写入请求；
-- 多线程并发（`-w`）**仅作用于不同 Conversation 之间**，绝不在同一个 Conversation 内部乱序并发，彻底杜绝因并发导致的记忆时序因果倒置。
+### 1. In-Order Session Delivery Within Conversations
+For a given `isolation_key` (i.e., a single conversation), MemBridge **strictly delivers sessions serially in ascending chronological order**:
+- The client only dispatches the next session after receiving a successful `200 OK` response for the previous one;
+- Multi-threading (`-w`) **only operates across different conversations**, never within the same conversation, eliminating race conditions or reversed causal timelines.
 
-### 2. 严格基于 `isolation_key` 隔离存储（杜绝跨对话脏写）
-并发 Worker 是以独立 Conversation 为调度粒度的。打到服务端的每个请求携带全局唯一的 `isolation_key`（例如 `run01_conv_1` 与 `run01_conv_2`）。
-- **服务端红线**：严禁在全局单例变量中追加写入记忆，必须将 `isolation_key` 作为数据库/向量集合的分区主键（Partition Key / Namespace / Collection）；
-- 保证多线程同时发起 Ingest 时，Conversation 1 的事实绝不会写入 Conversation 2 的记忆库。
+### 2. Strict Partitioning by `isolation_key`
+Concurrent workers schedule independent conversations. Every request sent to the server carries a globally unique `isolation_key` (e.g., `run01_conv_1` and `run01_conv_2`):
+- **Server Rule**: Never append memories to global singleton variables. Use `isolation_key` as the partition key, namespace, or collection ID;
+- Ensure that concurrent ingest operations for Conversation 1 never leak into Conversation 2.
 
-### 3. 生产级 ASGI Web 容器部署
-- 避免使用单进程单线程的开发服务器；
-- 推荐使用 FastAPI 搭配生产级多 Worker ASGI 容器：
+### 3. Production ASGI Deployment
+- Avoid single-process, single-threaded development servers;
+- Deploy FastAPI or equivalent frameworks with multi-worker ASGI containers:
   ```bash
   uvicorn server:app --host 0.0.0.0 --port 8002 --workers 4
   ```
 
-### 4. 数据库与向量库连接池配置
-- 如果 Memory Server 底层使用了 PostgreSQL、MySQL、Qdrant 或 Milvus，数据库连接池上限（`pool_size` 与 `max_overflow`）必须大于或等于评测端的 `--max-workers` 线程数；
-- 避免连接池排空导致请求阻塞超时（`QueuePool limit exceeded`）。
+### 4. Connection Pool Sizing
+- If the server utilizes PostgreSQL, MySQL, Qdrant, or Milvus, ensure the connection pool size (`pool_size` + `max_overflow`) is greater than or equal to the client's `--max-workers`;
+- Prevents request timeouts caused by pool exhaustion (`QueuePool limit exceeded`).
 
-### 5. 评测端默认保护机制
-- **默认单线程安全模式**：如果不显式传 `-w`，评测框架**默认使用 `--max-workers 1`（单线程串行模式）**；
-- 任何轻量级、单线程、甚至本地写文件的初级 Memory Demo 都能 100% 稳定运行，不会因并发导致崩溃；只有确认服务端支持并发时才建议调大 `-w`。
+### 5. Safe Client Defaults
+- **Default Single-Worker Mode**: Omitting `-w` defaults to `--max-workers 1` (serial execution);
+- Lightweight, single-threaded, or local file-based memory prototypes run reliably without crashes; scale `-w` only when the server is built for concurrency.
 
 ---
 
-## 运行
+## Getting Started
 
-评测中间层与被测记忆系统采用 **C/S 微服务解耦架构**：
-评测端只负责发送评测流量（调度 Ingest、Retrieve 并打分），被测记忆系统作为独立 HTTP Server 运行（实现 `/ingest` 与 `/retrieve`）。
+MemBridge and the memory system under test communicate via decoupled HTTP APIs:
+The client orchestrates evaluation workloads (Ingest, Retrieve, and Scoring), while the memory system runs as an independent HTTP server.
 
-### 1. 安装 uv 与依赖初始化
+### 1. Install uv & Initialize Environment
 
-推荐使用现代 Python 极速包管理工具 [uv](https://docs.astral.sh/uv/) 初始化环境：
+We recommend [uv](https://docs.astral.sh/uv/) for high-speed dependency management:
 
 ```bash
-# 1. 安装 uv (如未安装)
+# 1. Install uv (if not already installed)
 # macOS / Linux:
 curl -LsSf https://astral.sh/uv/install.sh | sh
-# 或使用 Homebrew:
+# Or via Homebrew:
 # brew install uv
 
-# 2. 一键创建虚拟环境并锁定安装依赖
+# 2. Sync dependencies into virtual environment
 uv sync
 ```
 
-### 2. 配置环境变量
+### 2. Configure Environment Variables
 
-复制 `.env.example` 为 `.env`，配置用于答题和裁判的大模型参数：
+Copy `.env.example` to `.env` to configure LLM parameters for answer generation and evaluation:
 
 ```bash
 cp .env.example .env
 ```
 
-在 `.env` 中填写以下变量（兼容任何提供 OpenAI `/v1/chat/completions` 接口的模型服务或中转地址）：
+Set the required variables in `.env` (compatible with OpenAI `/v1/chat/completions` or any compatible proxy):
 
 ```bash
 API_KEY=your_api_key_here
@@ -264,9 +266,9 @@ BASE_URL=https://api.openai.com/v1
 MODEL_NAME=gpt-4o-mini
 ```
 
-### 3. 运行自动化契约测试
+### 3. Run Automated Contract Tests
 
-在运行真实实验前，可运行测试套件验证代码与文档防漂移契约：
+Verify system integrity and documentation drift contracts before running experiments:
 
 ```bash
 uv run pytest -q
@@ -274,125 +276,125 @@ uv run pytest -q
 
 ---
 
-### 4. 运行评测实验
+### 4. Running Evaluations
 
-#### 方式 A：一键极速冒烟探活（秒级验证外部服务连通性与接口对齐）
+#### Option A: One-Click Fast Smoke Test (Verify Connectivity & Serialization in Seconds)
 
-启动你的 Memory Server 后，运行一键冒烟命令，验证网络路由与实体反序列化是否正常：
+After starting your Memory Server, run the smoke test to verify network routing and entity serialization:
 
 ```bash
-uv run memory-benchmark run --smoke --server-url http://127.0.0.1:8002
+uv run membridge run --smoke --server-url http://127.0.0.1:8002
 ```
 
-> **`--smoke` 的作用**：自动安全锁定为「1 个会话、1 个 Session、1 道考题」，在真实网络层仅触发 1 次 `POST /ingest` 与 1 次 `POST /retrieve`，秒级跑通全流程，避免长会话建库等待与 Token 浪费。
+> **What `--smoke` does**: Constrains execution to "1 conversation, 1 session, 1 question". Triggers exactly 1 `POST /ingest` and 1 `POST /retrieve`, verifying the end-to-end pipeline in seconds without token waste or indexing delays.
 
-#### 方式 B：全量生产端到端评测（默认全量数据）
+#### Option B: Full Production Evaluation (Default Full Dataset)
 
-通过 `--server-url` 指定你的 Memory Server 真实访问地址（默认全量评测）：
+Specify your server endpoint via `--server-url` (defaults to the full dataset):
 
 ```bash
-uv run memory-benchmark run \
+uv run membridge run \
   -b locomo \
   --server-url http://127.0.0.1:8002 \
   --metrics f1
 ```
 
-#### 方式 C：流水线阶段解耦分步执行（写入 / 答题 / 打分 物理分离）
+#### Option C: Decoupled Multi-Phase Execution (Separate Ingest, Query, and Eval)
 
-当被测记忆系统入库耗时较长，或需要多次调试 Prompt / 指标时，可分步执行：
+When memory ingestion is computationally expensive or when tuning prompts and metrics repeatedly:
 
 ```bash
-# 阶段 1：仅将长对话历史注入外部记忆服务（不发题、不调答题 LLM）
-uv run memory-benchmark ingest -b locomo --server-url http://127.0.0.1:8002
+# Phase 1: Ingest dialogue sessions into the memory server (no answering LLM calls)
+uv run membridge ingest -b locomo --server-url http://127.0.0.1:8002
 
-# 阶段 2：仅检索记忆并生成回答（假设数据已写入，不重复 Ingest）
-uv run memory-benchmark query -b locomo --server-url http://127.0.0.1:8002
+# Phase 2: Retrieve memories and generate answers (assumes data is ingested)
+uv run membridge query -b locomo --server-url http://127.0.0.1:8002
 
-# 阶段 3：仅离线计算评估打分（强绑定 --run-dir 与 --metrics，无需再打扰 Memory Server）
-uv run memory-benchmark eval --run-dir outputs/locomo_http --metrics f1,exact_match
+# Phase 3: Evaluate predictions offline (requires --run-dir & --metrics, no server requests)
+uv run membridge eval --run-dir outputs/locomo_http --metrics f1,exact_match
 ```
 
 ---
 
-## 命令行参数完整参考 (CLI Reference)
+## CLI Reference
 
-MemBridge 采用 **子命令（Subcommand）流水线架构**，各阶段职责与参数独立，杜绝隐式依赖耦合：
+MemBridge employs a **subcommand pipeline architecture**, keeping parameters and phase responsibilities decoupled:
 
-| 子命令 (Subcommand) | 核心职责 | 典型调用场景 |
+| Subcommand | Core Responsibility | Typical Use Case |
 | :--- | :--- | :--- |
-| `run` *(缺省默认)* | 一站式全流程评测 (Ingest $\rightarrow$ Query $\rightarrow$ Evaluate) | 日常全量评测、冒烟验收 |
-| `ingest` | 阶段一：仅向 Memory Server 写入长对话 Session 历史 | 耗时记忆预热、持久化建库 |
-| `query` | 阶段二：仅根据已写入的记忆检索并生成回答 | 调试答题 Prompt、更换回答模型 |
-| `eval` | 阶段三：仅离线读取已有产物打分（强绑定 `--metrics`） | 多指标离线复评、无 Token 损耗复验 |
+| `run` *(default)* | End-to-end evaluation (Ingest $\rightarrow$ Query $\rightarrow$ Evaluate) | Full benchmark runs, smoke testing |
+| `ingest` | Phase 1: Ingest long-dialogue session history into Memory Server | Database warmup, offline pre-indexing |
+| `query` | Phase 2: Retrieve memories and generate answers | Tuning prompt templates, testing answer models |
+| `eval` | Phase 3: Offline metric scoring on saved predictions (requires `--metrics`) | Offline re-evaluation without LLM/server costs |
 
-### 1. 核心通用参数 (Global & Data Options)
+### 1. Global & Data Options
 
-适用于 `run`、`ingest`、`query` 子命令（直接执行 `memory-benchmark [options]` 默认作为 `run` 处理）：
+Applicable to `run`, `ingest`, and `query` subcommands (`membridge [options]` defaults to `run`):
 
-| 参数 (Option) | 短选项 | 默认值 | 取值范围 / 示例 | 说明 |
+| Option | Short | Default | Choices / Example | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `--benchmark` | `-b` | `locomo` | `locomo`, `longmemeval`, `halumem`, `beam`, `membench` | 目标评测基准数据集。 |
-| `--smoke` | - | `False` | 标志位（无需值） | **一键安全冒烟模式**：强制锁定为 1 个会话 + 1 个 Session + 1 道题，秒级完成全链路验证。**不传时默认 100% 全量评测**。 |
-| `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | 被测 Memory Server 的真实 HTTP 根地址。 |
-| `--max-workers` | `-w` | `1` | 整数（如 `4`, `10`） | 会话级多线程并发 Worker 数。评测自动按原始索引确定性升序归并产物。 |
-| `--run-id` | - | 自动生成 | 字符串（如 `exp_locomo_01`） | 显式指定实验运行 ID，产物统一持久化在 `outputs/{run_id}/`。 |
-| `--project-root` | - | `.` | 路径字符串 | 项目根目录路径。 |
+| `--benchmark` | `-b` | `locomo` | `locomo`, `longmemeval`, `halumem`, `beam`, `membench` | Target benchmark dataset. |
+| `--smoke` | - | `False` | Flag | **One-click smoke mode**: Locks to 1 conversation, 1 session, 1 question for instant verification. Defaults to full evaluation when omitted. |
+| `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | HTTP base URL of the Memory Server under test. |
+| `--max-workers` | `-w` | `1` | Integer (e.g., `4`, `10`) | Number of concurrent conversation workers. Results are merged deterministically in ascending order. |
+| `--run-id` | - | Auto-generated | String (e.g., `exp_locomo_01`) | Explicit experiment run ID. Artifacts are saved to `outputs/{run_id}/`. |
+| `--project-root` | - | `.` | Path string | Root directory path of the project. |
 
-### 2. 评测打分与模型控制 (Metrics & LLM Options)
+### 2. Metrics & LLM Options
 
-适用于 `run`（在线打分）与 `eval`（离线重打分）：
+Applicable to `run` (online evaluation) and `eval` (offline re-scoring):
 
-| 参数 (Option) | 短选项 | 默认值 | 取值范围 / 示例 | 说明 |
+| Option | Short | Default | Choices / Example | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `--metrics` | - | `f1` | `f1`, `exact_match`, `llm_judge` | 逗号分隔的评估指标列表，如 `--metrics f1,exact_match`。在 `eval` 模式下为核心评估依据。 |
-| `--mock-llm` | - | `False` | 标志位（无需值） | 强制使用本地确定性 Fake 客户端生成回答，绝不发起外部 LLM API 请求（适用于 `run` 与 `query` 离线测试）。 |
+| `--metrics` | - | `f1` | `f1`, `exact_match`, `llm_judge` | Comma-separated evaluation metrics (e.g., `--metrics f1,exact_match`). |
+| `--mock-llm` | - | `False` | Flag | Uses deterministic local mock client for answers without external API calls. |
 
-### 3. 离线打分专属选项 (Offline Eval Options)
+### 3. Offline Evaluation Options
 
-仅适用于 `eval` 子命令：
+Applicable exclusively to the `eval` subcommand:
 
-| 参数 (Option) | 短选项 | 默认值 | 取值范围 / 示例 | 说明 |
+| Option | Short | Default | Choices / Example | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `--run-dir` | - | **必填** | `outputs/locomo_http` | 目标实验输出目录（包含 `method_predictions.jsonl`）。 |
+| `--run-dir` | - | **Required** | `outputs/locomo_http` | Path to target experiment output directory (containing `method_predictions.jsonl`). |
 
 ---
 
-## 常用评测场景示例 (Cookbook)
+## Cookbook & Common Scenarios
 
-#### 场景 1：一键极速冒烟探活（秒级验证外部服务连通性）
+#### Scenario 1: One-Click Quick Smoke Test
 ```bash
-uv run memory-benchmark run --smoke --server-url http://127.0.0.1:8002
+uv run membridge run --smoke --server-url http://127.0.0.1:8002
 ```
 
-#### 场景 2：全量真实评测（默认全量数据，对接外部微服务）
+#### Scenario 2: Full Benchmark Run (Default Full Dataset against External Service)
 ```bash
-uv run memory-benchmark run \
+uv run membridge run \
   -b locomo \
   --server-url http://127.0.0.1:8002 \
   --metrics f1
 ```
 
-#### 场景 3：10 线程高并发加速评测（推荐用于 LoCoMo 全量 10 个独立会话）
+#### Scenario 3: 10-Worker High-Concurrency Acceleration (Recommended for LoCoMo)
 ```bash
-uv run memory-benchmark run \
+uv run membridge run \
   -b locomo \
   --server-url http://127.0.0.1:8002 \
   -w 10 \
   --metrics f1
 ```
 
-#### 场景 4：多指标复合评测（同时运行 F1 与精确匹配）
+#### Scenario 4: Multi-Metric Evaluation (F1 + Exact Match)
 ```bash
-uv run memory-benchmark run \
+uv run membridge run \
   -b locomo \
   --server-url http://127.0.0.1:8002 \
   --smoke \
   --metrics f1,exact_match
 ```
 
-#### 场景 5：离线二次评估（无需再次请求 Memory Server 与重复消耗 Token）
+#### Scenario 5: Offline Re-Evaluation (Zero Token Cost & No Server Ingestion)
 ```bash
-uv run memory-benchmark eval \
+uv run membridge eval \
   --run-dir outputs/locomo_http \
   --metrics exact_match,llm_judge
 ```
