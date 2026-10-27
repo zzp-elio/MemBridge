@@ -75,7 +75,7 @@
 
 ## 记忆系统对接协议与接口实体规范 (C/S API Specification)
 
-被测记忆服务（Method Server / Docker 容器）只需暴露以下两个标准 HTTP POST 端点，并统一采用仿 Spring Boot 的 `Result[T]` JSON 信封响应：
+被测记忆服务（Method Server / Docker 容器）只需暴露以下两个标准 HTTP POST 端点，并统一采用 `Result[T]` JSON 信封响应：
 
 ### 1. 记忆写入端点 (`POST /ingest`)
 
