@@ -13,7 +13,7 @@ The evaluation client acts as an orchestrator sending benchmark workloads (manag
 
 ## System Architecture
 
-![MemBridge Architecture](assets/architecture.png)
+![MemBridge Architecture](assets/architecture_en.png)
 
 The system is logically partitioned into three decoupled tiers:
 
