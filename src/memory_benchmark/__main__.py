@@ -10,9 +10,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import subprocess
 import sys
+import uuid
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +40,72 @@ from memory_benchmark.readers import (
 from memory_benchmark.runners.evaluation import run_artifact_evaluation
 from memory_benchmark.runners.prediction import PredictionRunPolicy, run_predictions
 from memory_benchmark.storage import RunContext
+
+
+def generate_run_id(benchmark: str, method: str) -> str:
+    """生成不会与上一次默认实验撞车的 run_id。"""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{benchmark}_{method}_{stamp}_{uuid.uuid4().hex[:8]}"
+
+
+def _validate_run_id(run_id: str) -> str:
+    if (
+        not isinstance(run_id, str)
+        or not run_id.strip()
+        or run_id.strip() in {".", ".."}
+        or "/" in run_id
+        or "\\" in run_id
+    ):
+        raise ConfigurationError("run_id must be a single non-empty path segment")
+    return run_id.strip()
+
+
+def _prepare_run_directory(
+    output_root: Path,
+    run_id: str,
+    *,
+    resume: bool,
+    force: bool,
+    allow_existing: bool = False,
+) -> None:
+    if resume and force:
+        raise ConfigurationError("Pass only one of --resume or --force")
+    run_dir = output_root / run_id
+    if resume and not run_dir.is_dir():
+        raise ConfigurationError(f"--resume requires an existing run directory: {run_dir}")
+    occupied = run_dir.exists() and any(run_dir.iterdir())
+    if occupied and not resume and not force and not allow_existing:
+        raise ConfigurationError(
+            f"Run directory already exists: {run_dir}. "
+            "Pass --resume to continue it or --force to overwrite it."
+        )
+
+
+def _git_commit(project_root: Path) -> str | None:
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    commit = output.strip()
+    return commit or None
+
+
+def _prompt_sha256(prompts: Any) -> str:
+    payload = {
+        "answer_system": prompts.answer_system,
+        "answer_user": prompts.answer_user,
+        "judge_system": prompts.judge_system,
+        "judge_user": prompts.judge_user,
+        "task_answer_prompts": prompts.task_answer_prompts,
+        "task_judge_prompts": prompts.task_judge_prompts,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _slice_dataset(
@@ -118,6 +189,12 @@ def _add_common_conn_args(parser: argparse.ArgumentParser) -> None:
         default="http://127.0.0.1:8002",
         help="Base URL of target Memory Server (default: http://127.0.0.1:8002).",
     )
+    g.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=None,
+        help="HTTP read timeout for ingest and retrieve. Default remains 1800 seconds.",
+    )
     # 隐藏的内部测试选项，用户默认 100% 为 HTTP 独立微服务
     g.add_argument(
         "-m",
@@ -144,7 +221,19 @@ def _add_common_exec_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--run-id",
         default=None,
-        help="Explicit experiment run_id identifier.",
+        help="Explicit experiment run_id. Defaults to a unique generated id.",
+    )
+    g.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Continue an existing run_id, skipping conversations already checkpointed.",
+    )
+    g.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Overwrite an existing run directory instead of refusing.",
     )
 
 
@@ -347,6 +436,12 @@ def main(argv: list[str] | None = None) -> int:
             provider_cfg["base_url"] = args.server_url or "http://127.0.0.1:8002"
         elif args.server_url and args.method != "mock":
             provider_cfg["base_url"] = args.server_url
+        timeout_seconds = getattr(args, "timeout_seconds", None)
+        if timeout_seconds is not None:
+            provider_cfg["timeout_seconds"] = timeout_seconds
+        api_token = os.environ.get("MEMORY_SERVER_TOKEN", "").strip()
+        if api_token:
+            provider_cfg["api_token"] = api_token
         provider = create_provider(args.method, config=provider_cfg)
 
         prof = app_cfg.profile(args.benchmark)
@@ -374,7 +469,22 @@ def main(argv: list[str] | None = None) -> int:
                     prompts=prof.prompts,
                 )
 
-        run_id = args.run_id or f"{args.benchmark}_{args.method}"
+        resume = bool(getattr(args, "resume", False))
+        force = bool(getattr(args, "force", False))
+        if resume and not args.run_id:
+            raise ConfigurationError("--resume requires --run-id")
+        if args.subcommand == "query" and not args.run_id:
+            raise ConfigurationError(
+                "query requires --run-id from the ingest run, so retrieval hits the same isolation key"
+            )
+        run_id = _validate_run_id(args.run_id or generate_run_id(args.benchmark, args.method))
+        _prepare_run_directory(
+            Path(app_cfg.outputs_root),
+            run_id,
+            resume=resume,
+            force=force,
+            allow_existing=args.subcommand == "query",
+        )
         run_ctx = RunContext.create(
             run_id=run_id,
             benchmark_name=args.benchmark,
@@ -389,13 +499,26 @@ def main(argv: list[str] | None = None) -> int:
         skip_ingest = is_query_only or bool(getattr(args, "skip_ingest", False))
         skip_retrieval = is_ingest_only
 
+        dataset_was_truncated = bool(smoke_enabled or max_sess or max_t)
         policy = PredictionRunPolicy(
             max_workers=max(1, args.max_workers),
             top_k=int(getattr(args, "top_k", 10)),
             skip_ingest=skip_ingest,
             skip_retrieval=skip_retrieval,
             isolation_prefix=getattr(args, "reuse_ingest_run_id", None),
+            resume=resume,
+            force=force,
+            dataset_was_truncated=dataset_was_truncated,
         )
+        benchmark_variant = getattr(adapter, "variant", None) or "default"
+        manifest_extra = {
+            "answer_model": prof.answer_llm.model,
+            "judge_model": prof.judge_llm.model,
+            "prompt_sha256": _prompt_sha256(prof.prompts),
+            "git_commit": _git_commit(Path(app_cfg.project_root)),
+            "server_url": args.server_url,
+            "timeout_seconds": provider_cfg.get("timeout_seconds", 1800.0),
+        }
 
         pred_summary = run_predictions(
             dataset,
@@ -404,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
             policy=policy,
             answer_reader=reader,
             top_k=policy.top_k,
+            benchmark_variant=benchmark_variant,
+            manifest_extra=manifest_extra,
         )
 
         # ingest 子命令直接打印写入报告
@@ -424,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
                     default=str,
                 )
             )
-            return 0
+            return 1 if pred_summary.failed_conversations else 0
 
         # query 子命令打印检索与回答生成报告
         if args.subcommand == "query":
@@ -436,7 +561,7 @@ def main(argv: list[str] | None = None) -> int:
                     default=str,
                 )
             )
-            return 0
+            return 1 if pred_summary.failed_conversations else 0
 
         # run 子命令继续执行在线评估打分
         metrics = [m.strip() for m in str(args.metrics).split(",") if m.strip()]
@@ -464,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
                 default=str,
             )
         )
-        return 0
+        return 1 if pred_summary.failed_conversations else 0
 
     except KeyboardInterrupt:
         print("\nAborted by user.")

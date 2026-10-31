@@ -41,6 +41,11 @@ markers = [
     "api: 会调用真实外部 LLM API 的测试",
 ]
 
+[project.optional-dependencies]
+beam = [
+    "datasets>=2.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",

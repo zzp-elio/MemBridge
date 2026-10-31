@@ -305,13 +305,13 @@ When memory ingestion is computationally expensive or when tuning prompts and me
 
 ```bash
 # Phase 1: Ingest dialogue sessions into the memory server (no answering LLM calls)
-uv run membridge ingest -b locomo --server-url http://127.0.0.1:8002
+uv run membridge ingest -b locomo --run-id exp_locomo_01 --server-url http://127.0.0.1:8002
 
-# Phase 2: Retrieve memories and generate answers (assumes data is ingested)
-uv run membridge query -b locomo --server-url http://127.0.0.1:8002
+# Phase 2: Retrieve with the same --run-id, so the isolation key matches the ingest
+uv run membridge query -b locomo --run-id exp_locomo_01 --server-url http://127.0.0.1:8002
 
 # Phase 3: Evaluate predictions offline (requires --run-dir & --metrics, no server requests)
-uv run membridge eval --run-dir outputs/locomo_http --metrics f1,exact_match
+uv run membridge eval --run-dir outputs/exp_locomo_01 --metrics f1,exact_match
 ```
 
 ---
@@ -337,7 +337,10 @@ Applicable to `run`, `ingest`, and `query` subcommands (`membridge [options]` de
 | `--smoke` | - | `False` | Flag | **One-click smoke mode**: Locks to 1 conversation, 1 session, 1 question for instant verification. Defaults to full evaluation when omitted. |
 | `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | HTTP base URL of the Memory Server under test. |
 | `--max-workers` | `-w` | `1` | Integer (e.g., `4`, `10`) | Number of concurrent conversation workers. Results are merged deterministically in ascending order. |
-| `--run-id` | - | Auto-generated | String (e.g., `exp_locomo_01`) | Explicit experiment run ID. Artifacts are saved to `outputs/{run_id}/`. |
+| `--run-id` | - | Auto-generated unique id | String (e.g., `exp_locomo_01`) | Experiment id. Defaults to `{benchmark}_{method}_{utc-timestamp}_{8 hex}`. Artifacts are saved to `outputs/{run_id}/`. An existing directory is refused unless `--resume` or `--force` is set. |
+| `--resume` | - | `False` | Flag | Continue the given `--run-id`, skipping conversations already marked completed in the checkpoint. |
+| `--force` | - | `False` | Flag | Overwrite an existing run directory. |
+| `--timeout-seconds` | - | `1800` | Positive number | HTTP timeout for ingest and retrieve. The default stays 1800 because one session can take minutes to build. |
 | `--project-root` | - | `.` | Path string | Root directory path of the project. |
 
 ### 2. Metrics & LLM Options

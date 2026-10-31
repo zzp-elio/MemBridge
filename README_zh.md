@@ -305,13 +305,13 @@ uv run membridge run \
 
 ```bash
 # 阶段 1：仅将长对话历史注入外部记忆服务（不发题、不调答题 LLM）
-uv run membridge ingest -b locomo --server-url http://127.0.0.1:8002
+uv run membridge ingest -b locomo --run-id exp_locomo_01 --server-url http://127.0.0.1:8002
 
-# 阶段 2：仅检索记忆并生成回答（假设数据已写入，不重复 Ingest）
-uv run membridge query -b locomo --server-url http://127.0.0.1:8002
+# 阶段 2：必须带上同一次 ingest 的 --run-id，检索才会命中同一块记忆
+uv run membridge query -b locomo --run-id exp_locomo_01 --server-url http://127.0.0.1:8002
 
 # 阶段 3：仅离线计算评估打分（强绑定 --run-dir 与 --metrics，无需再打扰 Memory Server）
-uv run membridge eval --run-dir outputs/locomo_http --metrics f1,exact_match
+uv run membridge eval --run-dir outputs/exp_locomo_01 --metrics f1,exact_match
 ```
 
 ---
@@ -337,7 +337,10 @@ MemBridge 采用 **子命令（Subcommand）流水线架构**，各阶段职责�
 | `--smoke` | - | `False` | 标志位（无需值） | **一键安全冒烟模式**：强制锁定为 1 个会话 + 1 个 Session + 1 道题，秒级完成全链路验证。**不传时默认 100% 全量评测**。 |
 | `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | 被测 Memory Server 的真实 HTTP 根地址。 |
 | `--max-workers` | `-w` | `1` | 整数（如 `4`, `10`） | 会话级多线程并发 Worker 数。评测自动按原始索引确定性升序归并产物。 |
-| `--run-id` | - | 自动生成 | 字符串（如 `exp_locomo_01`） | 显式指定实验运行 ID，产物统一持久化在 `outputs/{run_id}/`。 |
+| `--run-id` | - | 自动生成的唯一 ID | 字符串（如 `exp_locomo_01`） | 实验 ID。缺省为 `{benchmark}_{method}_{UTC时间}_{8位hex}`，产物在 `outputs/{run_id}/`。目录已存在时直接报错，除非同时给出 `--resume` 或 `--force`。 |
+| `--resume` | - | `False` | 标志位 | 继续指定的 `--run-id`，跳过检查点里已经完成的 conversation。 |
+| `--force` | - | `False` | 标志位 | 允许覆盖已有实验目录。 |
+| `--timeout-seconds` | - | `1800` | 正数 | ingest / retrieve 的 HTTP 超时。默认保持 1800 秒，因为单个 Session 的记忆构建可以到分钟级。 |
 | `--project-root` | - | `.` | 路径字符串 | 项目根目录路径。 |
 
 ### 2. 评测打分与模型控制 (Metrics & LLM Options)

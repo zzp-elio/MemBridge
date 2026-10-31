@@ -43,6 +43,12 @@ class EvaluationRunSummary:
     correct_count: int | None
     score_path: str
     summary_path: str
+    missing_questions: int = 0
+    completion_rate: float | None = None
+    conditional_mean_score: float | None = None
+    scorable_mean_score: float | None = None
+    human_review_count: int = 0
+    judge_error_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,16 +105,24 @@ def run_artifact_evaluation(
         private_by_id=private_by_id,
     )
 
-    completed_question_ids = [
-        qid for qid in ordered_question_ids if qid in prediction_by_id
-    ]
     should_skip_category = getattr(evaluator, "should_skip_category", None)
-    eligible_question_ids = [
+
+    def _category_skipped(question_id: str) -> bool:
+        if not callable(should_skip_category):
+            return False
+        return bool(should_skip_category(public_by_id[question_id].get("category")))
+
+    completed_question_ids = [
         qid
-        for qid in completed_question_ids
-        if not callable(should_skip_category)
-        or not should_skip_category(public_by_id[qid].get("category"))
+        for qid in ordered_question_ids
+        if qid in prediction_by_id and not _category_skipped(qid)
     ]
+    missing_question_ids = [
+        qid
+        for qid in ordered_question_ids
+        if qid not in prediction_by_id and not _category_skipped(qid)
+    ]
+    eligible_question_ids = completed_question_ids
 
     eval_results = _evaluate_questions(
         evaluator=evaluator,
@@ -123,10 +137,50 @@ def run_artifact_evaluation(
     categories: dict[str, str] = {}
     capabilities: dict[str, str] = {}
     metric_name: str | None = None
-    score_sum = 0.0
     correct_values: list[bool] = []
+    eval_by_id = {item["question_id"]: item for item in eval_results}
+    fallback_metric_name = getattr(evaluator, "metric_name", None)
 
-    for result_item in eval_results:
+    ordered_score_ids = [
+        qid
+        for qid in ordered_question_ids
+        if qid in eval_by_id or qid in missing_question_ids
+    ]
+    for qid in ordered_score_ids:
+        if qid in missing_question_ids:
+            public_record = public_by_id[qid]
+            result_metric_name = (
+                fallback_metric_name
+                if isinstance(fallback_metric_name, str) and fallback_metric_name.strip()
+                else "unknown"
+            )
+            if metric_name is None:
+                metric_name = result_metric_name
+            elif result_metric_name != metric_name:
+                raise ConfigurationError(
+                    "evaluator returned inconsistent metric_name across questions"
+                )
+            raw_category = public_record.get("category")
+            raw_capability = public_record.get("capability")
+            score_records.append(
+                {
+                    "question_id": qid,
+                    "conversation_id": public_record.get("conversation_id"),
+                    "metric_name": result_metric_name,
+                    "score": 0.0,
+                    "is_correct": False,
+                    "category": raw_category,
+                    "capability": raw_capability,
+                    "details": {"status": "missing_prediction"},
+                }
+            )
+            if raw_category is not None:
+                categories[qid] = str(raw_category)
+            if raw_capability is not None:
+                capabilities[qid] = str(raw_capability)
+            correct_values.append(False)
+            continue
+        result_item = eval_by_id[qid]
         qid = result_item["question_id"]
         result_metric_name = result_item["metric_name"]
         if metric_name is None:
@@ -151,7 +205,6 @@ def run_artifact_evaluation(
             categories[qid] = str(result_item["category"])
         if result_item.get("capability") is not None:
             capabilities[qid] = str(result_item["capability"])
-        score_sum += float(result_item["score"])
         if result_item["is_correct"] is not None:
             correct_values.append(bool(result_item["is_correct"]))
 
@@ -162,7 +215,20 @@ def run_artifact_evaluation(
     score_path = paths.metric_scores_path(resolved_metric_name)
     summary_path = paths.metric_summary_path(resolved_metric_name)
     total_questions = len(score_records)
-    mean_score = score_sum / total_questions if total_questions else 0.0
+    missing_questions = len(missing_question_ids)
+    human_review_count = sum(1 for record in score_records if _needs_human_review(record))
+    judge_error_count = sum(1 for record in score_records if _is_judge_error(record))
+    scorable_records = [record for record in score_records if not _excluded_from_mean(record)]
+    decided_records = [
+        record
+        for record in scorable_records
+        if (record.get("details") or {}).get("status") != "missing_prediction"
+    ]
+    mean_score = _mean_score(scorable_records)
+    conditional_mean_score = _mean_score(decided_records)
+    completion_rate = (
+        (total_questions - missing_questions) / total_questions if total_questions else None
+    )
     correct_count = (
         sum(1 for val in correct_values if val) if correct_values else None
     )
@@ -176,6 +242,12 @@ def run_artifact_evaluation(
         correct_count=correct_count,
         score_path=str(score_path.resolve()),
         summary_path=str(summary_path.resolve()),
+        missing_questions=missing_questions,
+        completion_rate=completion_rate,
+        conditional_mean_score=conditional_mean_score,
+        scorable_mean_score=conditional_mean_score,
+        human_review_count=human_review_count,
+        judge_error_count=judge_error_count,
     )
     summary_dict = summary.to_dict()
     if categories:
@@ -190,6 +262,38 @@ def run_artifact_evaluation(
     atomic_write_jsonl(score_path, score_records)
     atomic_write_json(summary_path, summary_dict)
     return summary
+
+
+def _excluded_from_mean(record: dict[str, Any]) -> bool:
+    """UNDECIDABLE 与 JUDGE_ERROR 不进入自动均分。缺预测的题保留，并按 0 分计入。"""
+    details = record.get("details")
+    if not isinstance(details, dict):
+        return False
+    if details.get("exclude_from_scorable_mean") is True:
+        return True
+    return details.get("verdict") in {"UNDECIDABLE", "JUDGE_ERROR"}
+
+
+def _is_judge_error(record: dict[str, Any]) -> bool:
+    details = record.get("details")
+    return isinstance(details, dict) and details.get("verdict") == "JUDGE_ERROR"
+
+
+def _needs_human_review(record: dict[str, Any]) -> bool:
+    details = record.get("details")
+    if not isinstance(details, dict):
+        return False
+    return bool(
+        details.get("human_review_required") is True
+        or details.get("needs_human_review") is True
+        or details.get("verdict") in {"UNDECIDABLE", "JUDGE_ERROR"}
+    )
+
+
+def _mean_score(records: list[dict[str, Any]]) -> float | None:
+    if not records:
+        return None
+    return sum(float(record["score"]) for record in records) / len(records)
 
 
 def _evaluate_questions(

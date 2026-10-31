@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -39,6 +42,7 @@ from memory_benchmark.storage import (
     RunContext,
     atomic_write_json,
     atomic_write_jsonl,
+    read_jsonl,
 )
 from memory_benchmark.utils.run_logger import RunLogger
 
@@ -48,17 +52,17 @@ def default_isolation_key(run_id: str, conversation_id: str) -> str:
     return f"{run_id}_{conversation_id}"
 
 
-def count_context_tokens(text: str) -> int:
-    """统计检索返回的 `formatted_memory` 的 Token 数量（衡量下游 Reader LLM 上下文开销）。"""
+def count_context_tokens(text: str) -> tuple[int, str]:
+    """统计检索返回的 `formatted_memory` 的 Token 数量，并标出计数方法。"""
     if not text or not text.strip():
-        return 0
+        return 0, "empty"
     try:
         import tiktoken
 
         enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+        return len(enc.encode(text)), "tiktoken:cl100k_base"
     except Exception:
-        return len(text.split())
+        return len(text.split()), "whitespace_split"
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,9 @@ class PredictionRunPolicy:
     skip_ingest: bool = False
     skip_retrieval: bool = False
     isolation_prefix: str | None = None
+    resume: bool = False
+    force: bool = False
+    dataset_was_truncated: bool = False
 
     def __post_init__(self) -> None:
         if self.max_workers < 1:
@@ -118,9 +125,15 @@ class _ConversationExecutionResult:
     prediction_records: list[dict[str, Any]]
     answer_prompt_records: list[dict[str, Any]]
     ingest_latencies_ms: list[float]
+    server_ingest_latencies_ms: list[float | None]
     retrieve_latencies_ms: list[float]
+    server_retrieve_latencies_ms: list[float | None]
     context_tokens: list[int]
+    context_token_methods: list[str]
     status_entry: dict[str, Any]
+
+
+_RETRIEVE_METADATA_BLOCKLIST = frozenset({"choices", "options"})
 
 
 def _execute_single_conversation(
@@ -139,6 +152,7 @@ def _execute_single_conversation(
     skip_ingest: bool = False,
     skip_retrieval: bool = False,
     isolation_prefix: str | None = None,
+    dataset_was_truncated: bool = False,
     logger: RunLogger,
 ) -> _ConversationExecutionResult:
     conv_id = conversation.conversation_id
@@ -147,35 +161,46 @@ def _execute_single_conversation(
     try:
         if skip_ingest:
             conv_ingest_latencies = [0.0]
+            server_ingest_latencies: list[float | None] = [None]
         else:
-            conv_ingest_latencies = _ingest_conversation(
+            conv_ingest_latencies, server_ingest_latencies = _ingest_conversation(
                 conversation=conversation,
                 isolation_key=isolation_key,
                 provider=provider,
+                dataset_was_truncated=dataset_was_truncated,
             )
 
         pred_records: list[dict[str, Any]] = []
         prompt_records: list[dict[str, Any]] = []
         ret_latencies: list[float] = []
+        server_ret_latencies: list[float | None] = []
         ctx_tokens_list: list[int] = []
+        token_methods: list[str] = []
 
         if not skip_retrieval:
             for question in questions:
-                pred_record, prompt_record, ret_latency_ms, ctx_tokens = (
-                    _retrieve_and_answer_question(
-                        question=question,
-                        isolation_key=isolation_key,
-                        provider=provider,
-                        answer_reader=answer_reader,
-                        unified_prompt_builder=unified_prompt_builder,
-                        prediction_transform=prediction_transform,
-                        top_k=top_k,
-                    )
+                (
+                    pred_record,
+                    prompt_record,
+                    ret_latency_ms,
+                    server_ret_latency_ms,
+                    ctx_tokens,
+                    token_method,
+                ) = _retrieve_and_answer_question(
+                    question=question,
+                    isolation_key=isolation_key,
+                    provider=provider,
+                    answer_reader=answer_reader,
+                    unified_prompt_builder=unified_prompt_builder,
+                    prediction_transform=prediction_transform,
+                    top_k=top_k,
                 )
                 pred_records.append(pred_record)
                 prompt_records.append(prompt_record)
                 ret_latencies.append(ret_latency_ms)
+                server_ret_latencies.append(server_ret_latency_ms)
                 ctx_tokens_list.append(ctx_tokens)
+                token_methods.append(token_method)
 
         status_entry = {
             "status": "completed",
@@ -188,8 +213,11 @@ def _execute_single_conversation(
             prediction_records=pred_records,
             answer_prompt_records=prompt_records,
             ingest_latencies_ms=conv_ingest_latencies,
+            server_ingest_latencies_ms=server_ingest_latencies,
             retrieve_latencies_ms=ret_latencies,
+            server_retrieve_latencies_ms=server_ret_latencies,
             context_tokens=ctx_tokens_list,
+            context_token_methods=token_methods,
             status_entry=status_entry,
         )
     except Exception as exc:
@@ -213,6 +241,7 @@ def run_predictions(
     prediction_transform: Callable[[AnswerResult], AnswerResult] | None = None,
     top_k: int = 10,
     benchmark_variant: str = "default",
+    manifest_extra: dict[str, Any] | None = None,
 ) -> PredictionRunSummary:
     """执行 `Ingest(Session) -> Retrieve -> Answer` 全流程并落盘标准 Artifacts。"""
 
@@ -221,18 +250,43 @@ def run_predictions(
     selected_questions = _select_questions(selected_conversations, active_policy)
 
     paths = ExperimentPaths.create(run_context.run_dir)
-    manifest = {
-        "run_id": run_context.run_id,
-        "benchmark_name": dataset.dataset_name,
-        "benchmark_variant": benchmark_variant,
-        "method_name": run_context.method_name,
-    }
-    atomic_write_json(paths.manifest_path, manifest)
-    _write_question_artifacts(
+    progress_path = paths.checkpoints_dir / "conversation_progress.jsonl"
+    if active_policy.force and progress_path.exists():
+        progress_path.unlink()
+    question_ids = _selected_question_ids(selected_conversations, selected_questions)
+    if active_policy.resume and paths.public_questions_path.is_file():
+        existing_ids = [
+            str(record.get("question_id"))
+            for record in read_jsonl(paths.public_questions_path, recover_torn_tail=True)
+        ]
+        if existing_ids != question_ids:
+            raise ConfigurationError(
+                "Cannot resume: the selected question ids do not match the saved run"
+            )
+    else:
+        _write_question_artifacts(
+            paths=paths,
+            conversations=selected_conversations,
+            selected_questions=selected_questions,
+        )
+    manifest = _build_manifest(
         paths=paths,
-        conversations=selected_conversations,
-        selected_questions=selected_questions,
+        run_context=run_context,
+        dataset_name=dataset.dataset_name,
+        benchmark_variant=benchmark_variant,
+        policy=active_policy,
+        manifest_extra=manifest_extra,
     )
+    atomic_write_json(paths.manifest_path, manifest)
+    completed_prior = (
+        _load_completed_progress(progress_path) if active_policy.resume else {}
+    )
+    if active_policy.skip_ingest:
+        completed_prior = {
+            conv_id: result
+            for conv_id, result in completed_prior.items()
+            if result.prediction_records
+        }
 
     prediction_records: list[dict[str, Any]] = []
     answer_prompt_records: list[dict[str, Any]] = []
@@ -241,12 +295,18 @@ def run_predictions(
     failed_conversations = 0
 
     session_ingest_latencies_ms: list[float] = []
+    server_ingest_latencies_ms: list[float] = []
     question_retrieve_latencies_ms: list[float] = []
+    server_retrieve_latencies_ms: list[float] = []
     question_context_tokens: list[int] = []
 
     logger = RunLogger(paths.logs_dir)
-    indexed_conversations = list(enumerate(selected_conversations))
-    conv_results: list[_ConversationExecutionResult] = []
+    indexed_conversations = [
+        (idx, conv)
+        for idx, conv in enumerate(selected_conversations)
+        if conv.conversation_id not in completed_prior
+    ]
+    conv_results: list[_ConversationExecutionResult] = list(completed_prior.values())
     first_error: Exception | None = None
 
     effective_top_k = active_policy.top_k if active_policy and active_policy.top_k != 10 else top_k
@@ -271,16 +331,19 @@ def run_predictions(
                     skip_ingest=skip_ingest,
                     skip_retrieval=skip_retrieval,
                     isolation_prefix=isolation_prefix,
+                    dataset_was_truncated=active_policy.dataset_was_truncated,
                     logger=logger,
                 ): idx
                 for idx, conv in indexed_conversations
             }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
-                conv = indexed_conversations[idx][1]
+                conv = next(item for item in indexed_conversations if item[0] == idx)[1]
                 conv_id = conv.conversation_id
                 try:
-                    conv_results.append(future.result())
+                    result = future.result()
+                    conv_results.append(result)
+                    _append_progress(progress_path, result, status="completed")
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc
@@ -293,6 +356,7 @@ def run_predictions(
                         "conversation_failed",
                         {"conversation_id": conv_id, "error": str(exc)},
                     )
+                    _append_progress_failure(progress_path, idx, conv_id, exc)
     else:
         for idx, conv in indexed_conversations:
             conv_id = conv.conversation_id
@@ -310,9 +374,11 @@ def run_predictions(
                     skip_ingest=skip_ingest,
                     skip_retrieval=skip_retrieval,
                     isolation_prefix=isolation_prefix,
+                    dataset_was_truncated=active_policy.dataset_was_truncated,
                     logger=logger,
                 )
                 conv_results.append(res)
+                _append_progress(progress_path, res, status="completed")
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
@@ -325,6 +391,7 @@ def run_predictions(
                     "conversation_failed",
                     {"conversation_id": conv_id, "error": str(exc)},
                 )
+                _append_progress_failure(progress_path, idx, conv_id, exc)
 
     conv_results.sort(key=lambda r: r.index)
 
@@ -332,7 +399,13 @@ def run_predictions(
         prediction_records.extend(r.prediction_records)
         answer_prompt_records.extend(r.answer_prompt_records)
         session_ingest_latencies_ms.extend(r.ingest_latencies_ms)
+        server_ingest_latencies_ms.extend(
+            value for value in r.server_ingest_latencies_ms if value is not None
+        )
         question_retrieve_latencies_ms.extend(r.retrieve_latencies_ms)
+        server_retrieve_latencies_ms.extend(
+            value for value in r.server_retrieve_latencies_ms if value is not None
+        )
         question_context_tokens.extend(r.context_tokens)
         conversation_status[r.conv_id] = r.status_entry
         completed_conversations += 1
@@ -348,24 +421,13 @@ def run_predictions(
     atomic_write_jsonl(paths.answer_prompts_path, answer_prompt_records)
     atomic_write_json(paths.conversation_status_path, conversation_status)
 
-    efficiency_metrics = {
-        "total_ingest_latency_ms": round(sum(session_ingest_latencies_ms), 3),
-        "mean_session_ingest_latency_ms": round(
-            sum(session_ingest_latencies_ms) / len(session_ingest_latencies_ms), 3
-        )
-        if session_ingest_latencies_ms
-        else 0.0,
-        "mean_retrieve_latency_ms": round(
-            sum(question_retrieve_latencies_ms) / len(question_retrieve_latencies_ms), 3
-        )
-        if question_retrieve_latencies_ms
-        else 0.0,
-        "mean_retrieved_context_tokens": round(
-            sum(question_context_tokens) / len(question_context_tokens), 2
-        )
-        if question_context_tokens
-        else 0.0,
-    }
+    efficiency_metrics = _efficiency_metrics(
+        client_ingest_ms=session_ingest_latencies_ms,
+        server_ingest_ms=server_ingest_latencies_ms,
+        client_retrieve_ms=question_retrieve_latencies_ms,
+        server_retrieve_ms=server_retrieve_latencies_ms,
+        context_tokens=question_context_tokens,
+    )
 
     total_questions = sum(len(qs) for qs in selected_questions.values())
     summary = PredictionRunSummary(
@@ -385,20 +447,195 @@ def run_predictions(
     return summary
 
 
+def _selected_question_ids(
+    conversations: list[Conversation],
+    selected_questions: dict[str, list[Question]],
+) -> list[str]:
+    return [
+        question.question_id
+        for conversation in conversations
+        for question in selected_questions[conversation.conversation_id]
+    ]
+
+
+def _build_manifest(
+    *,
+    paths: ExperimentPaths,
+    run_context: RunContext,
+    dataset_name: str,
+    benchmark_variant: str,
+    policy: PredictionRunPolicy,
+    manifest_extra: dict[str, Any] | None,
+) -> dict[str, Any]:
+    manifest: dict[str, Any] = {
+        "run_id": run_context.run_id,
+        "benchmark_name": dataset_name,
+        "benchmark_variant": benchmark_variant,
+        "method_name": run_context.method_name,
+        "model_name": run_context.model_name,
+        "started_at": run_context.started_at,
+        "max_workers": policy.max_workers,
+        "dataset_was_truncated": policy.dataset_was_truncated,
+    }
+    if manifest_extra:
+        manifest.update(manifest_extra)
+    if policy.resume and paths.manifest_path.is_file():
+        try:
+            previous = json.loads(paths.manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = {}
+        if isinstance(previous, dict) and previous.get("started_at"):
+            manifest["started_at"] = previous["started_at"]
+        manifest["resumed_at"] = datetime.now(timezone.utc).isoformat()
+    return manifest
+
+
+def _append_json_line(path: os.PathLike[str] | str, record: dict[str, Any]) -> None:
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _append_progress(
+    path: os.PathLike[str] | str,
+    result: _ConversationExecutionResult,
+    *,
+    status: str,
+) -> None:
+    payload = asdict(result)
+    payload["status"] = status
+    _append_json_line(path, payload)
+
+
+def _append_progress_failure(
+    path: os.PathLike[str] | str,
+    index: int,
+    conv_id: str,
+    exc: Exception,
+) -> None:
+    _append_json_line(
+        path,
+        {
+            "index": index,
+            "conv_id": conv_id,
+            "status": "failed",
+            "error": str(exc),
+            "prediction_records": [],
+            "answer_prompt_records": [],
+            "ingest_latencies_ms": [],
+            "server_ingest_latencies_ms": [],
+            "retrieve_latencies_ms": [],
+            "server_retrieve_latencies_ms": [],
+            "context_tokens": [],
+            "context_token_methods": [],
+            "status_entry": {"status": "failed", "error": str(exc)},
+        },
+    )
+
+
+def _load_completed_progress(path: os.PathLike[str] | str) -> dict[str, _ConversationExecutionResult]:
+    from pathlib import Path
+
+    target = Path(path)
+    if not target.is_file():
+        return {}
+    latest: dict[str, dict[str, Any]] = {}
+    for record in read_jsonl(target, recover_torn_tail=True):
+        conv_id = record.get("conv_id")
+        if isinstance(conv_id, str) and conv_id:
+            latest[conv_id] = record
+    loaded: dict[str, _ConversationExecutionResult] = {}
+    for conv_id, record in latest.items():
+        if record.get("status") != "completed":
+            continue
+        loaded[conv_id] = _ConversationExecutionResult(
+            index=int(record["index"]),
+            conv_id=conv_id,
+            prediction_records=list(record.get("prediction_records") or []),
+            answer_prompt_records=list(record.get("answer_prompt_records") or []),
+            ingest_latencies_ms=[float(value) for value in record.get("ingest_latencies_ms") or []],
+            server_ingest_latencies_ms=list(record.get("server_ingest_latencies_ms") or []),
+            retrieve_latencies_ms=[float(value) for value in record.get("retrieve_latencies_ms") or []],
+            server_retrieve_latencies_ms=list(record.get("server_retrieve_latencies_ms") or []),
+            context_tokens=[int(value) for value in record.get("context_tokens") or []],
+            context_token_methods=[str(value) for value in record.get("context_token_methods") or []],
+            status_entry=dict(record.get("status_entry") or {"status": "completed"}),
+        )
+    return loaded
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * fraction
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    weight = rank - low
+    return ordered[low] * (1.0 - weight) + ordered[high] * weight
+
+
+def _efficiency_metrics(
+    *,
+    client_ingest_ms: list[float],
+    server_ingest_ms: list[float],
+    client_retrieve_ms: list[float],
+    server_retrieve_ms: list[float],
+    context_tokens: list[int],
+) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
+        "total_ingest_latency_ms": round(sum(client_ingest_ms), 3),
+        "mean_session_ingest_latency_ms": (
+            round(_mean(client_ingest_ms), 3) if client_ingest_ms else 0.0
+        ),
+        "mean_server_ingest_latency_ms": (
+            round(_mean(server_ingest_ms), 3) if server_ingest_ms else None
+        ),
+        "mean_retrieve_latency_ms": (
+            round(_mean(client_retrieve_ms), 3) if client_retrieve_ms else 0.0
+        ),
+        "p50_retrieve_latency_ms": (
+            round(_percentile(client_retrieve_ms, 0.50), 3) if client_retrieve_ms else None
+        ),
+        "p95_retrieve_latency_ms": (
+            round(_percentile(client_retrieve_ms, 0.95), 3) if client_retrieve_ms else None
+        ),
+        "mean_server_retrieve_latency_ms": (
+            round(_mean(server_retrieve_ms), 3) if server_retrieve_ms else None
+        ),
+        "mean_retrieved_context_tokens": (
+            round(_mean([float(value) for value in context_tokens]), 2) if context_tokens else 0.0
+        ),
+    }
+    return metrics
+
+
 def _ingest_conversation(
     *,
     conversation: Conversation,
     isolation_key: str,
     provider: MemoryProvider,
-) -> list[float]:
-    latencies_ms: list[float] = []
+    dataset_was_truncated: bool = False,
+) -> tuple[list[float], list[float | None]]:
+    client_latencies_ms: list[float] = []
+    server_latencies_ms: list[float | None] = []
     num_sessions = len(conversation.sessions)
     for s_idx, session in enumerate(conversation.sessions):
-        is_last_session = (s_idx == num_sessions - 1)
+        is_last_session = (s_idx == num_sessions - 1) and not dataset_was_truncated
         request = IngestRequest(
             isolation_key=isolation_key,
             session=session,
             metadata={"is_last_session": is_last_session},
+            idempotency_key=f"{isolation_key}:{session.session_id}",
         )
         start = time.perf_counter()
         result = provider.ingest(request)
@@ -407,8 +644,9 @@ def _ingest_conversation(
             raise RuntimeError(
                 f"Ingest failed with code={result.code} for session '{session.session_id}': {result.message}"
             )
-        latencies_ms.append(result.latency_ms if result.latency_ms > 0 else wall_ms)
-    return latencies_ms
+        client_latencies_ms.append(wall_ms)
+        server_latencies_ms.append(result.latency_ms if result.latency_ms > 0 else None)
+    return client_latencies_ms, server_latencies_ms
 
 
 def _retrieve_and_answer_question(
@@ -422,7 +660,7 @@ def _retrieve_and_answer_question(
     ),
     prediction_transform: Callable[[AnswerResult], AnswerResult] | None,
     top_k: int,
-) -> tuple[dict[str, Any], dict[str, Any], float, int]:
+) -> tuple[dict[str, Any], dict[str, Any], float, float | None, int, str]:
     """对单个问题执行记忆检索 (`retrieve`)、统计检索耗时与 Context Tokens，并生成回答 (`answer`)。"""
 
     req = RetrieveRequest(
@@ -431,7 +669,11 @@ def _retrieve_and_answer_question(
         question_time=question.question_time,
         top_k=top_k,
         question_id=question.question_id,
-        metadata=dict(question.metadata),
+        metadata={
+            key: value
+            for key, value in question.metadata.items()
+            if key not in _RETRIEVE_METADATA_BLOCKLIST
+        },
     )
 
     start = time.perf_counter()
@@ -442,10 +684,10 @@ def _retrieve_and_answer_question(
             f"Retrieve failed with code={res.code} for question '{question.question_id}': {res.message}"
         )
 
-    retrieve_latency_ms = res.latency_ms if res.latency_ms > 0 else wall_ms
+    server_latency_ms = res.latency_ms if res.latency_ms > 0 else None
     payload = res.data
     formatted_memory = payload.formatted_memory
-    context_tokens = count_context_tokens(formatted_memory)
+    context_tokens, token_method = count_context_tokens(formatted_memory)
 
     if unified_prompt_builder is not None:
         prompt_result = unified_prompt_builder(question, payload)
@@ -484,8 +726,13 @@ def _retrieve_and_answer_question(
     merged_metadata = dict(answer.metadata)
     merged_metadata.update(
         {
-            "retrieve_latency_ms": round(retrieve_latency_ms, 3),
+            "retrieve_latency_ms": round(wall_ms, 3),
+            "client_retrieve_latency_ms": round(wall_ms, 3),
+            "server_retrieve_latency_ms": (
+                round(server_latency_ms, 3) if server_latency_ms is not None else None
+            ),
             "retrieved_context_tokens": context_tokens,
+            "retrieved_context_token_method": token_method,
         }
     )
 
@@ -500,10 +747,22 @@ def _retrieve_and_answer_question(
         "conversation_id": question.conversation_id,
         "formatted_memory": formatted_memory,
         "retrieved_context_tokens": context_tokens,
-        "retrieve_latency_ms": round(retrieve_latency_ms, 3),
+        "retrieved_context_token_method": token_method,
+        "retrieve_latency_ms": round(wall_ms, 3),
+        "client_retrieve_latency_ms": round(wall_ms, 3),
+        "server_retrieve_latency_ms": (
+            round(server_latency_ms, 3) if server_latency_ms is not None else None
+        ),
         "answer_prompt": prompt_result.answer_prompt,
     }
-    return prediction_record, prompt_record, retrieve_latency_ms, context_tokens
+    return (
+        prediction_record,
+        prompt_record,
+        wall_ms,
+        server_latency_ms,
+        context_tokens,
+        token_method,
+    )
 
 
 def _default_prompt_from_payload(

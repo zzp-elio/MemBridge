@@ -45,7 +45,20 @@ class ExactMatchEvaluator:
         gold_choice = str(gold.metadata.get("ground_truth") or "").strip().upper()
         if gold_choice in {"A", "B", "C", "D"}:
             m = _CHOICE_LETTER_RE.match(pred_raw)
-            pred_choice = m.group(1).upper() if m else pred_raw[:1].upper()
+            if m is None:
+                return MetricResult(
+                    metric_name=self.metric_name,
+                    score=0.0,
+                    is_correct=False,
+                    details={
+                        "question_id": question.question_id,
+                        "mode": "multiple_choice",
+                        "predicted_choice": None,
+                        "gold_choice": gold_choice,
+                        "choice_parse_status": "invalid_choice",
+                    },
+                )
+            pred_choice = m.group(1).upper()
             matched = pred_choice == gold_choice
             return MetricResult(
                 metric_name=self.metric_name,
@@ -56,6 +69,7 @@ class ExactMatchEvaluator:
                     "mode": "multiple_choice",
                     "predicted_choice": pred_choice,
                     "gold_choice": gold_choice,
+                    "choice_parse_status": "parsed",
                 },
             )
 

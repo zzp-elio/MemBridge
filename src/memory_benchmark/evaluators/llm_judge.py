@@ -32,6 +32,7 @@ from memory_benchmark.core import (
     MetricResult,
     PromptProperties,
     Question,
+    UnifiedCapability,
     build_prompt_variable_pool,
     format_prompt_template,
 )
@@ -45,7 +46,16 @@ VERDICT_SCORE_MAP: dict[str, float] = {
     "PARTIAL": 0.5,
     "WRONG": 0.0,
     "UNDECIDABLE": 0.0,
+    "JUDGE_ERROR": 0.0,
 }
+
+_NON_SCORABLE_VERDICTS = frozenset({"UNDECIDABLE", "JUDGE_ERROR"})
+
+
+def _has_exact_prompt(prompts: dict[str, str], name: str) -> bool:
+    """判断题型模板表里是否有与 name 精确对应的键（忽略大小写和连字符）。"""
+    target = name.strip().lower().replace("_", "-")
+    return any(key.strip().lower().replace("_", "-") == target for key in prompts)
 
 
 class BinaryJudgeEvaluation(BaseModel):
@@ -105,9 +115,12 @@ class JudgeDecision:
     reason: str
     needs_human_review: bool = False
     raw_response: str = ""
+    error_message: str | None = None
 
     @property
-    def is_correct(self) -> bool:
+    def is_correct(self) -> bool | None:
+        if self.verdict in {"UNDECIDABLE", "JUDGE_ERROR"}:
+            return None
         return self.verdict == "CORRECT" or self.score >= 1.0
 
 
@@ -244,7 +257,13 @@ class LLMJudgeEvaluator:
         gold: GoldAnswerInfo,
     ) -> MetricResult:
         """渲染注入的 `prompt_props`，调用 Judge LLM 并解析结构化裁决结果。"""
-        system_template = self.prompt_props.get_judge_system(question.category)
+        route_category = question.category
+        if (
+            question.unified_capability == UnifiedCapability.ABSTENTION
+            and _has_exact_prompt(self.prompt_props.task_judge_prompts, "abstention")
+        ):
+            route_category = "abstention"
+        system_template = self.prompt_props.get_judge_system(route_category)
         user_template = self.prompt_props.judge_user
 
         variables = build_prompt_variable_pool(
@@ -265,11 +284,12 @@ class LLMJudgeEvaluator:
             decision = parse_judge_response(raw_output, mode=self.mode)
         except Exception as exc:
             decision = JudgeDecision(
-                verdict="UNDECIDABLE",
+                verdict="JUDGE_ERROR",
                 score=0.0,
                 reason=f"Judge invocation failed after retries: {exc}",
                 needs_human_review=True,
-                judgment=f"ERROR: {exc}",
+                raw_response="",
+                error_message=str(exc),
             )
         return MetricResult(
             metric_name=self.metric_name,
@@ -282,6 +302,8 @@ class LLMJudgeEvaluator:
                 "verdict": decision.verdict,
                 "reason": decision.reason,
                 "needs_human_review": decision.needs_human_review,
+                "error_message": decision.error_message,
+                "exclude_from_scorable_mean": decision.verdict in _NON_SCORABLE_VERDICTS,
                 "judge_model": self.llm_props.model,
                 "judge_temperature": self.llm_props.temperature,
             },

@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import json
+import threading
 import time
 from typing import Any, Generic, TypeVar
 import urllib.error
@@ -107,11 +108,14 @@ class IngestRequest:
     isolation_key: str
     session: Session
     metadata: dict[str, Any] = field(default_factory=dict)
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.isolation_key, "isolation_key")
         if not isinstance(self.session, Session):
             raise ValueError("session must be a Session instance")
+        if self.idempotency_key is not None:
+            _require_text(self.idempotency_key, "idempotency_key")
         validate_no_private_keys(self.session.to_dict())
         validate_no_private_keys(self.metadata)
 
@@ -132,11 +136,14 @@ class IngestRequest:
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 JSON 请求体字典（供 HTTP `POST /ingest` 发送）。"""
-        return {
+        payload = {
             "isolation_key": self.isolation_key,
             "session": self.session.to_dict(),
             "metadata": dict(self.metadata),
         }
+        if self.idempotency_key:
+            payload["idempotency_key"] = self.idempotency_key
+        return payload
 
 
 @dataclass(frozen=True)
@@ -206,19 +213,26 @@ def _default_urllib_transport(
     payload: dict[str, Any],
     timeout_seconds: float | None,
     max_retries: int = 3,
+    headers: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """使用标准库 urllib 发送 JSON POST 请求并解析 JSON 响应，具备抗高并发短暂网络重试机制。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     last_error_message = ""
+    request_headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Connection": "close",
+    }
+    if headers:
+        request_headers.update(dict(headers))
+    idempotency_key = payload.get("idempotency_key")
+    if isinstance(idempotency_key, str) and idempotency_key.strip():
+        request_headers.setdefault("Idempotency-Key", idempotency_key.strip())
 
     for attempt in range(max_retries):
         req = urllib.request.Request(
             url=url,
             data=body,
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "Connection": "close",
-            },
+            headers=request_headers,
             method="POST",
         )
         try:
@@ -286,6 +300,7 @@ class HttpMemoryProvider(MemoryProvider):
         *,
         timeout_seconds: float | None = 1800.0,
         transport: HttpTransport | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url must be a non-empty string")
@@ -293,7 +308,26 @@ class HttpMemoryProvider(MemoryProvider):
             raise ValueError("timeout_seconds must be positive or None")
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
-        self._transport: HttpTransport = transport or _default_urllib_transport
+        self.headers = dict(headers or {})
+        if transport is None:
+            extra_headers = dict(self.headers)
+
+            def _transport(
+                url: str,
+                payload: dict[str, Any],
+                timeout: float | None,
+                _headers: Mapping[str, str] = extra_headers,
+            ) -> dict[str, Any]:
+                return _default_urllib_transport(
+                    url,
+                    payload,
+                    timeout,
+                    headers=_headers,
+                )
+
+            self._transport: HttpTransport = _transport
+        else:
+            self._transport = transport
 
     def ingest(self, request: IngestRequest) -> Result[None]:
         """调用远程 `POST /ingest` 接口写入一个 Session 的对话历史。"""
@@ -328,11 +362,30 @@ class HttpMemoryProvider(MemoryProvider):
 
         data_obj = raw_resp.get("data")
         if isinstance(data_obj, dict):
-            formatted_memory = str(data_obj.get("formatted_memory") or "")
+            if "formatted_memory" not in data_obj or not isinstance(
+                data_obj.get("formatted_memory"), str
+            ):
+                return Result.fail(
+                    code=502,
+                    message=(
+                        "Protocol error: a successful retrieve response requires "
+                        "data.formatted_memory as a string. An empty string is a "
+                        "valid empty retrieval; a missing or non-string field is not."
+                    ),
+                    latency_ms=latency_ms,
+                )
+            formatted_memory = data_obj["formatted_memory"]
         elif isinstance(data_obj, str):
             formatted_memory = data_obj
         else:
-            formatted_memory = str(raw_resp.get("formatted_memory") or "")
+            return Result.fail(
+                code=502,
+                message=(
+                    "Protocol error: a successful retrieve response requires "
+                    "data.formatted_memory"
+                ),
+                latency_ms=latency_ms,
+            )
 
         return Result.ok(
             RetrievePayload(formatted_memory=formatted_memory),
@@ -353,16 +406,31 @@ class MockMemoryProvider(MemoryProvider):
         self.default_context = default_context
         self.ingested_sessions_by_key: dict[str, list[str]] = {}
         self.turns_by_key: dict[str, list[str]] = {}
+        self._completed_idempotency_keys: set[str] = set()
+        self._lock = threading.Lock()
 
     def ingest(self, request: IngestRequest) -> Result[None]:
         """将一个 Session 的全部 Turn 按 `isolation_key` 存入内存。"""
         start = time.perf_counter()
-        key = request.isolation_key
-        self.ingested_sessions_by_key.setdefault(key, []).append(request.session_id)
-        bucket = self.turns_by_key.setdefault(key, [])
-        for turn in request.turns:
-            speaker = turn.speaker or turn.normalized_role or "speaker"
-            bucket.append(f"{speaker}: {turn.content}")
+        with self._lock:
+            if (
+                request.idempotency_key
+                and request.idempotency_key in self._completed_idempotency_keys
+            ):
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+                return Result.ok(
+                    None,
+                    message="duplicate ingest ignored",
+                    latency_ms=elapsed_ms,
+                )
+            key = request.isolation_key
+            self.ingested_sessions_by_key.setdefault(key, []).append(request.session_id)
+            bucket = self.turns_by_key.setdefault(key, [])
+            for turn in request.turns:
+                speaker = turn.speaker or turn.normalized_role or "speaker"
+                bucket.append(f"{speaker}: {turn.content}")
+            if request.idempotency_key:
+                self._completed_idempotency_keys.add(request.idempotency_key)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return Result.ok(None, latency_ms=elapsed_ms)
 
@@ -370,15 +438,16 @@ class MockMemoryProvider(MemoryProvider):
         """按 `isolation_key` 检索已写入的对话上下文并封装为 `Result[RetrievePayload]`。"""
         start = time.perf_counter()
         context: str | None = None
-        if request.question_id:
-            context = self.context_by_question_id.get(request.question_id)
-        if context is None:
-            stored_turns = self.turns_by_key.get(request.isolation_key, [])
-            context = (
-                self.default_context
-                or "\n".join(stored_turns)
-                or f"mock-context-for:{request.query}"
-            )
+        with self._lock:
+            if request.question_id:
+                context = self.context_by_question_id.get(request.question_id)
+            if context is None:
+                stored_turns = list(self.turns_by_key.get(request.isolation_key, []))
+                context = (
+                    self.default_context
+                    or "\n".join(stored_turns)
+                    or f"mock-context-for:{request.query}"
+                )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return Result.ok(
             RetrievePayload(formatted_memory=context),
@@ -410,9 +479,14 @@ def create_provider(
         base_url = str(cfg.get("base_url") or "http://127.0.0.1:8000")
         timeout_raw = cfg.get("timeout_seconds", 1800.0)
         timeout_seconds = float(timeout_raw) if timeout_raw is not None else None
+        headers = dict(cfg.get("headers") or {})
+        api_token = str(cfg.get("api_token") or "").strip()
+        if api_token and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {api_token}"
         return HttpMemoryProvider(
             base_url=base_url,
             timeout_seconds=timeout_seconds,
+            headers=headers,
         )
 
     raise ConfigurationError(

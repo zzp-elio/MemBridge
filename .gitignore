@@ -11,6 +11,14 @@
 !configs/**
 !src/
 !src/**
+!tests/
+!tests/**
+!docs/
+!docs/**
+!STATE.md
+!AGENTS.md
+!.github/
+!.github/**
 
 # Never track editor, bytecode, or setuptools metadata inside the allowlist.
 **/.DS_Store

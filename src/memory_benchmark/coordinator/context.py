@@ -137,6 +137,7 @@ class CoordinatorContext:
                 provider=provider,
                 run_context=run_ctx,
                 answer_reader=reader,
+                benchmark_variant=getattr(adapter, "variant", None) or "default",
             )
 
             eval_summaries: list[dict[str, Any]] = []

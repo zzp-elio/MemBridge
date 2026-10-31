@@ -47,6 +47,19 @@ class AnswerLLMResponse:
     api_called: bool = True
 
 
+def _plain_usage(usage: Any) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return dict(usage)
+    dump = getattr(usage, "model_dump", None)
+    if callable(dump):
+        dumped = dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return None
+
+
 def _format_options_text(options: dict[str, str] | None) -> str:
     if not options:
         return ""
@@ -100,24 +113,29 @@ class FrameworkAnswerReader:
         if not retrieval.prompt_messages:
             raise ConfigurationError(f"Empty prompt_messages for question '{question.question_id}'")
 
+        usage: dict[str, Any] | None = None
         complete_msgs = getattr(self.client, "complete_messages_with_metadata", None)
         if callable(complete_msgs):
             resp = complete_msgs(messages=retrieval.prompt_messages)
             answer_text = resp.text.strip()
+            usage = _plain_usage(getattr(resp, "usage", None))
         else:
             answer_text = self.client.complete(prompt=retrieval.answer_prompt).strip()
 
         if not answer_text:
             raise ConfigurationError(f"Answer reader returned empty answer for '{question.question_id}'")
 
+        metadata: dict[str, Any] = {
+            "answer_reader": "framework",
+            "answer_model": self.client.model_name,
+        }
+        if usage is not None:
+            metadata["answer_usage"] = usage
         return AnswerResult(
             question_id=question.question_id,
             conversation_id=question.conversation_id,
             answer=answer_text,
-            metadata={
-                "answer_reader": "framework",
-                "answer_model": self.client.model_name,
-            },
+            metadata=metadata,
         )
 
 
