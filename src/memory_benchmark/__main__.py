@@ -64,20 +64,14 @@ def _prepare_run_directory(
     output_root: Path,
     run_id: str,
     *,
-    resume: bool,
-    force: bool,
     allow_existing: bool = False,
 ) -> None:
-    if resume and force:
-        raise ConfigurationError("Pass only one of --resume or --force")
     run_dir = output_root / run_id
-    if resume and not run_dir.is_dir():
-        raise ConfigurationError(f"--resume requires an existing run directory: {run_dir}")
     occupied = run_dir.exists() and any(run_dir.iterdir())
-    if occupied and not resume and not force and not allow_existing:
+    if occupied and not allow_existing:
         raise ConfigurationError(
             f"Run directory already exists: {run_dir}. "
-            "Pass --resume to continue it or --force to overwrite it."
+            "Choose a new --run-id. Existing experiment files are left unchanged."
         )
 
 
@@ -221,19 +215,7 @@ def _add_common_exec_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--run-id",
         default=None,
-        help="Explicit experiment run_id. Defaults to a unique generated id.",
-    )
-    g.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help="Continue an existing run_id, skipping conversations already checkpointed.",
-    )
-    g.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Overwrite an existing run directory instead of refusing.",
+        help="Explicit experiment run_id. Defaults to a unique generated id. An existing directory is refused.",
     )
 
 
@@ -469,10 +451,6 @@ def main(argv: list[str] | None = None) -> int:
                     prompts=prof.prompts,
                 )
 
-        resume = bool(getattr(args, "resume", False))
-        force = bool(getattr(args, "force", False))
-        if resume and not args.run_id:
-            raise ConfigurationError("--resume requires --run-id")
         if args.subcommand == "query" and not args.run_id:
             raise ConfigurationError(
                 "query requires --run-id from the ingest run, so retrieval hits the same isolation key"
@@ -481,8 +459,6 @@ def main(argv: list[str] | None = None) -> int:
         _prepare_run_directory(
             Path(app_cfg.outputs_root),
             run_id,
-            resume=resume,
-            force=force,
             allow_existing=args.subcommand == "query",
         )
         run_ctx = RunContext.create(
@@ -506,8 +482,6 @@ def main(argv: list[str] | None = None) -> int:
             skip_ingest=skip_ingest,
             skip_retrieval=skip_retrieval,
             isolation_prefix=getattr(args, "reuse_ingest_run_id", None),
-            resume=resume,
-            force=force,
             dataset_was_truncated=dataset_was_truncated,
         )
         benchmark_variant = getattr(adapter, "variant", None) or "default"

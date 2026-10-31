@@ -10,6 +10,7 @@
 - **当前活跃任务（Active）**：
   - 🟢 暂无进行中的活跃任务（准备就绪）。
 - **历史已完成任务（Completed）**：
+  - ✅ [`docs/tasks/task-035-score-latency-and-data-docs.md`](docs/tasks/task-035-score-latency-and-data-docs.md)：去掉客户端断点恢复，统一分数口径，写清数据下载与按需分卷获取。39 passed。MemBench 已同步上传 Hugging Face。
   - ✅ [`docs/tasks/task-034-result-integrity.md`](docs/tasks/task-034-result-integrity.md)：评测结果可信度修复。37 passed。幂等键只保证客户端发送和 Mock 去重；不新增删除命名空间接口。
   - ✅ [`docs/tasks/task-033-english-architecture-diagram.md`](docs/tasks/task-033-english-architecture-diagram.md)：架构全景图英文版制作与双语文档对齐。
   - ✅ [`docs/tasks/task-032-bilingual-readme.md`](docs/tasks/task-032-bilingual-readme.md)：README.md 双语化改造（英文为主版本，中文为可选版本）。

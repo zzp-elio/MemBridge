@@ -290,11 +290,10 @@ sequenceDiagram
 
 ## 14. 实验隔离、分数口径与断点（ADR-030）
 
-1. **run 目录**：缺省 `run_id` 为 `{benchmark}_{method}_{UTC时间戳}_{8位hex}`。目标目录非空时，必须显式 `--resume` 或 `--force`，否则拒绝启动。
-2. **断点**：每个 conversation 结束后追加 `checkpoints/conversation_progress.jsonl`。`--resume` 跳过其中状态为 `completed` 的对话，并要求题目 id 序列与已保存的公开题一致。
-3. **分数**：没有预测的题按 0 分进入 `mean_score`，并写出 `completion_rate`。`UNDECIDABLE` 与 `JUDGE_ERROR` 不进入该均分；`conditional_mean_score` / `scorable_mean_score` 只平均已产出且可评分的预测。
-4. **延迟**：`retrieve_latency_ms`、Mean / P50 / P95 使用客户端墙钟。服务端返回的 `latency_ms` 记在 `server_retrieve_latency_ms`。
-5. **幂等**：`ingest` 请求体携带 `idempotency_key = {isolation_key}:{session_id}`，默认 HTTP 传输同时放进 `Idempotency-Key` 头。Mock 会忽略重复键。外部 Memory Server 必须自己识别该键，评测端不能代替它去重。
+1. **run 目录**：缺省 `run_id` 为 `{benchmark}_{method}_{UTC时间戳}_{8位hex}`。目录非空就拒绝启动，不覆盖、不删除。`query` 可以进入同一次 `ingest` 的目录。没有客户端断点恢复。
+2. **分数**：总分、category、capability 调用同一个 `calculate_score_statistics`。没有预测的题按 0 分进入 `overall_score`。`UNDECIDABLE` 与 `JUDGE_ERROR` 不进入自动均分。二者任一出现时，摘要 `provisional=true`。
+3. **延迟**：`retrieve_latency_ms`、Mean / P50 / P95 使用客户端墙钟。`Result.latency_ms` 只保留服务端自报值；缺字段为 null，返回 0 就记 0，不用客户端耗时填上。
+4. **幂等**：`ingest` 请求体携带 `idempotency_key = {isolation_key}:{session_id}`。Mock 会忽略重复键。外部 Memory Server 不认这个键时，重复 POST 仍可能双写。
 
 
 

@@ -45,19 +45,21 @@ class Result(Generic[T]):
         code: 状态码，200 表示成功，非 200（如 400/500/504）表示异常。
         message: 状态描述或异常原因说明。
         data: 泛型业务数据载荷（`ingest` 为 `None`，`retrieve` 为 `RetrievePayload`）。
-        latency_ms: 本次请求执行耗时（毫秒）。
+        latency_ms: 服务端自报的处理耗时（毫秒）。响应里没有该字段时为 None，不用客户端耗时填上。
     """
 
     code: int = 200
     message: str = "ok"
     data: T | None = None
-    latency_ms: float = 0.0
+    latency_ms: float | None = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, int) or isinstance(self.code, bool):
             raise ValueError("Result.code must be an integer")
-        if self.latency_ms < 0:
-            raise ValueError("Result.latency_ms must be non-negative")
+        if self.latency_ms is not None and (
+            isinstance(self.latency_ms, bool) or self.latency_ms < 0
+        ):
+            raise ValueError("Result.latency_ms must be a non-negative number or None")
 
     @property
     def is_success(self) -> bool:
@@ -70,7 +72,7 @@ class Result(Generic[T]):
         data: T | None = None,
         *,
         message: str = "ok",
-        latency_ms: float = 0.0,
+        latency_ms: float | None = 0.0,
     ) -> "Result[T]":
         """快速构造成功响应 (`code=200`)。"""
         return cls(code=200, message=message, data=data, latency_ms=latency_ms)
@@ -81,7 +83,7 @@ class Result(Generic[T]):
         code: int = 500,
         message: str = "error",
         *,
-        latency_ms: float = 0.0,
+        latency_ms: float | None = 0.0,
     ) -> "Result[T]":
         """快速构造失败响应 (`code != 200`)。"""
         if code == 200:
@@ -291,6 +293,13 @@ def _default_urllib_transport(
     return parsed
 
 
+def _server_latency_ms(raw_resp: Mapping[str, Any]) -> float | None:
+    """只读取服务端自报的 latency_ms。缺字段或 null 保持 None，0 保留为 0。"""
+    if "latency_ms" not in raw_resp or raw_resp.get("latency_ms") is None:
+        return None
+    return float(raw_resp["latency_ms"])
+
+
 class HttpMemoryProvider(MemoryProvider):
     """对接外部记忆系统 Server / Docker 容器的 HTTP 客户端中间层实现。"""
 
@@ -332,30 +341,25 @@ class HttpMemoryProvider(MemoryProvider):
     def ingest(self, request: IngestRequest) -> Result[None]:
         """调用远程 `POST /ingest` 接口写入一个 Session 的对话历史。"""
         url = f"{self.base_url}/ingest"
-        start = time.perf_counter()
         raw_resp = self._transport(url, request.to_dict(), self.timeout_seconds)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         code = int(raw_resp.get("code", 200))
         message = str(raw_resp.get("message") or ("ok" if code == 200 else "error"))
-        latency_ms = float(raw_resp.get("latency_ms") or elapsed_ms)
         return Result(
             code=code,
             message=message,
             data=None,
-            latency_ms=latency_ms,
+            latency_ms=_server_latency_ms(raw_resp),
         )
 
     def retrieve(self, request: RetrieveRequest) -> Result[RetrievePayload]:
         """调用远程 `POST /retrieve` 接口检索记忆并返回 `Result[RetrievePayload]`。"""
         url = f"{self.base_url}/retrieve"
-        start = time.perf_counter()
         raw_resp = self._transport(url, request.to_dict(), self.timeout_seconds)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         code = int(raw_resp.get("code", 200))
         message = str(raw_resp.get("message") or ("ok" if code == 200 else "error"))
-        latency_ms = float(raw_resp.get("latency_ms") or elapsed_ms)
+        latency_ms = _server_latency_ms(raw_resp)
 
         if code != 200:
             return Result.fail(code=code, message=message, latency_ms=latency_ms)

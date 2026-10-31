@@ -15,9 +15,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import json
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -42,7 +39,6 @@ from memory_benchmark.storage import (
     RunContext,
     atomic_write_json,
     atomic_write_jsonl,
-    read_jsonl,
 )
 from memory_benchmark.utils.run_logger import RunLogger
 
@@ -77,8 +73,6 @@ class PredictionRunPolicy:
     skip_ingest: bool = False
     skip_retrieval: bool = False
     isolation_prefix: str | None = None
-    resume: bool = False
-    force: bool = False
     dataset_was_truncated: bool = False
 
     def __post_init__(self) -> None:
@@ -250,27 +244,12 @@ def run_predictions(
     selected_questions = _select_questions(selected_conversations, active_policy)
 
     paths = ExperimentPaths.create(run_context.run_dir)
-    progress_path = paths.checkpoints_dir / "conversation_progress.jsonl"
-    if active_policy.force and progress_path.exists():
-        progress_path.unlink()
-    question_ids = _selected_question_ids(selected_conversations, selected_questions)
-    if active_policy.resume and paths.public_questions_path.is_file():
-        existing_ids = [
-            str(record.get("question_id"))
-            for record in read_jsonl(paths.public_questions_path, recover_torn_tail=True)
-        ]
-        if existing_ids != question_ids:
-            raise ConfigurationError(
-                "Cannot resume: the selected question ids do not match the saved run"
-            )
-    else:
-        _write_question_artifacts(
-            paths=paths,
-            conversations=selected_conversations,
-            selected_questions=selected_questions,
-        )
-    manifest = _build_manifest(
+    _write_question_artifacts(
         paths=paths,
+        conversations=selected_conversations,
+        selected_questions=selected_questions,
+    )
+    manifest = _build_manifest(
         run_context=run_context,
         dataset_name=dataset.dataset_name,
         benchmark_variant=benchmark_variant,
@@ -278,15 +257,6 @@ def run_predictions(
         manifest_extra=manifest_extra,
     )
     atomic_write_json(paths.manifest_path, manifest)
-    completed_prior = (
-        _load_completed_progress(progress_path) if active_policy.resume else {}
-    )
-    if active_policy.skip_ingest:
-        completed_prior = {
-            conv_id: result
-            for conv_id, result in completed_prior.items()
-            if result.prediction_records
-        }
 
     prediction_records: list[dict[str, Any]] = []
     answer_prompt_records: list[dict[str, Any]] = []
@@ -301,12 +271,8 @@ def run_predictions(
     question_context_tokens: list[int] = []
 
     logger = RunLogger(paths.logs_dir)
-    indexed_conversations = [
-        (idx, conv)
-        for idx, conv in enumerate(selected_conversations)
-        if conv.conversation_id not in completed_prior
-    ]
-    conv_results: list[_ConversationExecutionResult] = list(completed_prior.values())
+    indexed_conversations = list(enumerate(selected_conversations))
+    conv_results: list[_ConversationExecutionResult] = []
     first_error: Exception | None = None
 
     effective_top_k = active_policy.top_k if active_policy and active_policy.top_k != 10 else top_k
@@ -343,7 +309,6 @@ def run_predictions(
                 try:
                     result = future.result()
                     conv_results.append(result)
-                    _append_progress(progress_path, result, status="completed")
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc
@@ -356,7 +321,6 @@ def run_predictions(
                         "conversation_failed",
                         {"conversation_id": conv_id, "error": str(exc)},
                     )
-                    _append_progress_failure(progress_path, idx, conv_id, exc)
     else:
         for idx, conv in indexed_conversations:
             conv_id = conv.conversation_id
@@ -378,7 +342,6 @@ def run_predictions(
                     logger=logger,
                 )
                 conv_results.append(res)
-                _append_progress(progress_path, res, status="completed")
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
@@ -391,7 +354,6 @@ def run_predictions(
                     "conversation_failed",
                     {"conversation_id": conv_id, "error": str(exc)},
                 )
-                _append_progress_failure(progress_path, idx, conv_id, exc)
 
     conv_results.sort(key=lambda r: r.index)
 
@@ -447,20 +409,8 @@ def run_predictions(
     return summary
 
 
-def _selected_question_ids(
-    conversations: list[Conversation],
-    selected_questions: dict[str, list[Question]],
-) -> list[str]:
-    return [
-        question.question_id
-        for conversation in conversations
-        for question in selected_questions[conversation.conversation_id]
-    ]
-
-
 def _build_manifest(
     *,
-    paths: ExperimentPaths,
     run_context: RunContext,
     dataset_name: str,
     benchmark_variant: str,
@@ -479,94 +429,7 @@ def _build_manifest(
     }
     if manifest_extra:
         manifest.update(manifest_extra)
-    if policy.resume and paths.manifest_path.is_file():
-        try:
-            previous = json.loads(paths.manifest_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            previous = {}
-        if isinstance(previous, dict) and previous.get("started_at"):
-            manifest["started_at"] = previous["started_at"]
-        manifest["resumed_at"] = datetime.now(timezone.utc).isoformat()
     return manifest
-
-
-def _append_json_line(path: os.PathLike[str] | str, record: dict[str, Any]) -> None:
-    from pathlib import Path
-
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _append_progress(
-    path: os.PathLike[str] | str,
-    result: _ConversationExecutionResult,
-    *,
-    status: str,
-) -> None:
-    payload = asdict(result)
-    payload["status"] = status
-    _append_json_line(path, payload)
-
-
-def _append_progress_failure(
-    path: os.PathLike[str] | str,
-    index: int,
-    conv_id: str,
-    exc: Exception,
-) -> None:
-    _append_json_line(
-        path,
-        {
-            "index": index,
-            "conv_id": conv_id,
-            "status": "failed",
-            "error": str(exc),
-            "prediction_records": [],
-            "answer_prompt_records": [],
-            "ingest_latencies_ms": [],
-            "server_ingest_latencies_ms": [],
-            "retrieve_latencies_ms": [],
-            "server_retrieve_latencies_ms": [],
-            "context_tokens": [],
-            "context_token_methods": [],
-            "status_entry": {"status": "failed", "error": str(exc)},
-        },
-    )
-
-
-def _load_completed_progress(path: os.PathLike[str] | str) -> dict[str, _ConversationExecutionResult]:
-    from pathlib import Path
-
-    target = Path(path)
-    if not target.is_file():
-        return {}
-    latest: dict[str, dict[str, Any]] = {}
-    for record in read_jsonl(target, recover_torn_tail=True):
-        conv_id = record.get("conv_id")
-        if isinstance(conv_id, str) and conv_id:
-            latest[conv_id] = record
-    loaded: dict[str, _ConversationExecutionResult] = {}
-    for conv_id, record in latest.items():
-        if record.get("status") != "completed":
-            continue
-        loaded[conv_id] = _ConversationExecutionResult(
-            index=int(record["index"]),
-            conv_id=conv_id,
-            prediction_records=list(record.get("prediction_records") or []),
-            answer_prompt_records=list(record.get("answer_prompt_records") or []),
-            ingest_latencies_ms=[float(value) for value in record.get("ingest_latencies_ms") or []],
-            server_ingest_latencies_ms=list(record.get("server_ingest_latencies_ms") or []),
-            retrieve_latencies_ms=[float(value) for value in record.get("retrieve_latencies_ms") or []],
-            server_retrieve_latencies_ms=list(record.get("server_retrieve_latencies_ms") or []),
-            context_tokens=[int(value) for value in record.get("context_tokens") or []],
-            context_token_methods=[str(value) for value in record.get("context_token_methods") or []],
-            status_entry=dict(record.get("status_entry") or {"status": "completed"}),
-        )
-    return loaded
 
 
 def _mean(values: list[float]) -> float:
@@ -645,7 +508,7 @@ def _ingest_conversation(
                 f"Ingest failed with code={result.code} for session '{session.session_id}': {result.message}"
             )
         client_latencies_ms.append(wall_ms)
-        server_latencies_ms.append(result.latency_ms if result.latency_ms > 0 else None)
+        server_latencies_ms.append(result.latency_ms)
     return client_latencies_ms, server_latencies_ms
 
 
@@ -684,7 +547,7 @@ def _retrieve_and_answer_question(
             f"Retrieve failed with code={res.code} for question '{question.question_id}': {res.message}"
         )
 
-    server_latency_ms = res.latency_ms if res.latency_ms > 0 else None
+    server_latency_ms = res.latency_ms
     payload = res.data
     formatted_memory = payload.formatted_memory
     context_tokens, token_method = count_context_tokens(formatted_memory)

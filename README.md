@@ -178,7 +178,7 @@ Retrieves relevant memories based on the test query and isolation key. Returns p
 > **Dual Latency Tracking**:
 > - `latency_ms` in the response body is optional, representing internal server computation time;
 > - MemBridge continuously measures end-to-end network round-trip time (Wall-Clock Latency) on the client side using high-precision `time.perf_counter()`;
-> - If the server includes `latency_ms`, MemBridge records and reports both metrics, enabling clear comparison between server computation and network overhead.
+> - If the server includes `latency_ms`, MemBridge records it separately from the client round trip. A missing field stays null. A reported `0` stays `0`. Client time is never copied into the server field.
 
 ---
 
@@ -274,6 +274,61 @@ Verify system integrity and documentation drift contracts before running experim
 uv run pytest -q
 ```
 
+### Benchmark data
+
+Benchmark files are not tracked in this Git repository. Download them into `data/` at the project root.
+
+Dataset repository: [https://huggingface.co/datasets/BuptZZP/agentmemorybench-data](https://huggingface.co/datasets/BuptZZP/agentmemorybench-data)
+
+Log in to Hugging Face (acceptance of dataset terms is automatic with no manual wait):
+
+```bash
+pip install -U huggingface_hub
+hf auth login
+```
+
+#### Download Options
+
+- **Option A: Fast on-demand download for specific benchmarks (Recommended)**:
+  Download only what you need without pulling the full ~5.6 GB repository:
+  ```bash
+  # LoCoMo only (~2.7 MB, instant download, ideal for smoke tests)
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "locomo/**" --local-dir data
+
+  # MemBench only (~625 MB, 0-10k & 100k trajectories)
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "membench/**" --local-dir data
+
+  # HaluMem only (~134 MB)
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "halumem/**" --local-dir data
+
+  # LongMemEval (~2.8 GB) or BEAM (~1.2 GB)
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "longmemeval/**" --local-dir data
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "BEAM/**" --local-dir data
+  ```
+
+- **Option B: Full dataset download (~5.6 GB total)**:
+  ```bash
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --local-dir data
+  ```
+
+Run commands from the project root, or pass `--project-root`. Adapters read these paths:
+
+```text
+data/locomo/locomo10.json
+data/longmemeval/longmemeval_s_cleaned.json
+data/longmemeval/longmemeval_m_cleaned.json
+data/halumem/HaluMem-Medium.jsonl
+data/halumem/HaluMem-Long.jsonl
+data/BEAM/beam_dataset/100K
+data/BEAM/beam_dataset/500K
+data/BEAM/beam_dataset/1M
+data/BEAM/beam_10M_dataset/10M
+data/membench/Membenchdata/data2test/0-10k/
+data/membench/Membenchdata/data2test/100k/
+```
+
+All five primary benchmarks (`locomo`, `longmemeval`, `membench`, `halumem`, `BEAM`) are hosted in the dataset repository. Integrity checksums can be verified via `cd data && shasum -a 256 -c checksums.sha256`. Do not commit `data/` to Git. Each upstream dataset keeps its original license.
+
 ---
 
 ### 4. Running Evaluations
@@ -337,9 +392,7 @@ Applicable to `run`, `ingest`, and `query` subcommands (`membridge [options]` de
 | `--smoke` | - | `False` | Flag | **One-click smoke mode**: Locks to 1 conversation, 1 session, 1 question for instant verification. Defaults to full evaluation when omitted. |
 | `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | HTTP base URL of the Memory Server under test. |
 | `--max-workers` | `-w` | `1` | Integer (e.g., `4`, `10`) | Number of concurrent conversation workers. Results are merged deterministically in ascending order. |
-| `--run-id` | - | Auto-generated unique id | String (e.g., `exp_locomo_01`) | Experiment id. Defaults to `{benchmark}_{method}_{utc-timestamp}_{8 hex}`. Artifacts are saved to `outputs/{run_id}/`. An existing directory is refused unless `--resume` or `--force` is set. |
-| `--resume` | - | `False` | Flag | Continue the given `--run-id`, skipping conversations already marked completed in the checkpoint. |
-| `--force` | - | `False` | Flag | Overwrite an existing run directory. |
+| `--run-id` | - | Auto-generated unique id | String (e.g., `exp_locomo_01`) | Experiment id. Defaults to `{benchmark}_{method}_{utc-timestamp}_{8 hex}`. Artifacts are saved to `outputs/{run_id}/`. A non-empty directory is refused. `query` may reuse the ingest run id. |
 | `--timeout-seconds` | - | `1800` | Positive number | HTTP timeout for ingest and retrieve. The default stays 1800 because one session can take minutes to build. |
 | `--project-root` | - | `.` | Path string | Root directory path of the project. |
 

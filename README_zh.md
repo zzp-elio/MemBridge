@@ -178,7 +178,7 @@
 > **双轨延迟度量说明（Dual Latency Tracking）**：
 > - 响应体中的 `latency_ms` 为可选字段，代表 Memory Server 内部计算耗时；
 > - 评测框架在客户端始终通过高精度物理时钟 `time.perf_counter()` 自动测量端到端网络往返耗时（Wall-Clock Latency）；
-> - 若服务端在响应中返回了 `latency_ms`，评测框架会同时记录并在产物与摘要中展示两者，便于对比服务端内部处理耗时与网络开销。
+> - 若服务端返回了 `latency_ms`，它与客户端往返耗时分开记录。缺字段保持 null，返回 0 就记 0，不会把客户端耗时抄进服务端字段。
 
 ---
 
@@ -274,6 +274,61 @@ MODEL_NAME=gpt-4o-mini
 uv run pytest -q
 ```
 
+### Benchmark 数据集
+
+原始评测数据不在这个 Git 仓库里。请下载到项目根目录的 `data/`。
+
+数据集仓库：[https://huggingface.co/datasets/BuptZZP/agentmemorybench-data](https://huggingface.co/datasets/BuptZZP/agentmemorybench-data)
+
+先登录 Hugging Face（若页面要求同意数据条款，同意后会自动通过，无需人工审批）：
+
+```bash
+pip install -U huggingface_hub
+hf auth login
+```
+
+#### 下载方式
+
+- **方式 A：按需极速下载指定基准（推荐）**：
+  无需下载整套 ~5.6 GB 完整仓库，按需仅拉取当前实验所需数据：
+  ```bash
+  # 仅下载 LoCoMo（约 2.7 MB，秒级完成，推荐首选用于冒烟探活）
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "locomo/**" --local-dir data
+
+  # 仅下载 MemBench（约 625 MB，涵盖 0-10k 与 100k 轨迹）
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "membench/**" --local-dir data
+
+  # 仅下载 HaluMem（约 134 MB）
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "halumem/**" --local-dir data
+
+  # 下载 LongMemEval（约 2.8 GB）或 BEAM（约 1.2 GB）
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "longmemeval/**" --local-dir data
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --include "BEAM/**" --local-dir data
+  ```
+
+- **方式 B：下载全量数据集（约 5.6 GB）**：
+  ```bash
+  hf download BuptZZP/agentmemorybench-data --repo-type dataset --local-dir data
+  ```
+
+请在项目根目录运行，或用 `--project-root` 指向项目根。适配器读取的相对路径是：
+
+```text
+data/locomo/locomo10.json
+data/longmemeval/longmemeval_s_cleaned.json
+data/longmemeval/longmemeval_m_cleaned.json
+data/halumem/HaluMem-Medium.jsonl
+data/halumem/HaluMem-Long.jsonl
+data/BEAM/beam_dataset/100K
+data/BEAM/beam_dataset/500K
+data/BEAM/beam_dataset/1M
+data/BEAM/beam_10M_dataset/10M
+data/membench/Membenchdata/data2test/0-10k/
+data/membench/Membenchdata/data2test/100k/
+```
+
+当前仓库已完整收录五大基准（`locomo`、`longmemeval`、`membench`、`halumem`、`BEAM`）。下载后可在 `data/` 下使用 `shasum -a 256 -c checksums.sha256` 校验文件完整性。切勿将 `data/` 提交进 Git。各上游数据集仍保留其原始许可证。
+
 ---
 
 ### 4. 运行评测实验
@@ -337,9 +392,7 @@ MemBridge 采用 **子命令（Subcommand）流水线架构**，各阶段职责�
 | `--smoke` | - | `False` | 标志位（无需值） | **一键安全冒烟模式**：强制锁定为 1 个会话 + 1 个 Session + 1 道题，秒级完成全链路验证。**不传时默认 100% 全量评测**。 |
 | `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | 被测 Memory Server 的真实 HTTP 根地址。 |
 | `--max-workers` | `-w` | `1` | 整数（如 `4`, `10`） | 会话级多线程并发 Worker 数。评测自动按原始索引确定性升序归并产物。 |
-| `--run-id` | - | 自动生成的唯一 ID | 字符串（如 `exp_locomo_01`） | 实验 ID。缺省为 `{benchmark}_{method}_{UTC时间}_{8位hex}`，产物在 `outputs/{run_id}/`。目录已存在时直接报错，除非同时给出 `--resume` 或 `--force`。 |
-| `--resume` | - | `False` | 标志位 | 继续指定的 `--run-id`，跳过检查点里已经完成的 conversation。 |
-| `--force` | - | `False` | 标志位 | 允许覆盖已有实验目录。 |
+| `--run-id` | - | 自动生成的唯一 ID | 字符串（如 `exp_locomo_01`） | 实验 ID。缺省为 `{benchmark}_{method}_{UTC时间}_{8位hex}`，产物在 `outputs/{run_id}/`。目录非空就报错，不覆盖。`query` 可以复用同一次 ingest 的 run_id。 |
 | `--timeout-seconds` | - | `1800` | 正数 | ingest / retrieve 的 HTTP 超时。默认保持 1800 秒，因为单个 Session 的记忆构建可以到分钟级。 |
 | `--project-root` | - | `.` | 路径字符串 | 项目根目录路径。 |
 

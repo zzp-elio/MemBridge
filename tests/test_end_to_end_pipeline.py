@@ -1188,7 +1188,7 @@ def test_subcommand_pipeline_and_smoke(tmp_path: Path) -> None:
     root = str(sample_root)
     ret_ingest = main([
         "ingest", "--smoke", "-b", "locomo", "-m", "mock",
-        "--run-id", "pipeline_smoke", "--force", "--project-root", root,
+        "--run-id", "pipeline_smoke", "--project-root", root,
     ])
     assert ret_ingest == 0
 

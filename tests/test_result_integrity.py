@@ -102,26 +102,35 @@ def test_generate_run_id_is_unique_and_existing_directory_is_refused(tmp_path: P
     run_dir.mkdir()
     (run_dir / "manifest.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="already exists"):
-        _prepare_run_directory(tmp_path, "locomo_http", resume=False, force=False)
+        _prepare_run_directory(tmp_path, "locomo_http")
 
 
-def test_exact_match_does_not_take_the_first_character() -> None:
+def test_exact_match_accepts_only_a_whole_choice_token() -> None:
     evaluator = create_evaluator("exact_match")
     question = Question(question_id="mc", conversation_id="c", text="Which?")
-    gold = GoldAnswerInfo(question_id="mc", answer="Paris", metadata={"ground_truth": "A"})
-    apple = evaluator.evaluate(
-        question,
-        AnswerResult(question_id="mc", conversation_id="c", answer="Apple"),
-        gold,
-    )
-    explicit = evaluator.evaluate(
-        question,
-        AnswerResult(question_id="mc", conversation_id="c", answer="A."),
-        gold,
-    )
-    assert apple.score == 0.0
-    assert apple.details["choice_parse_status"] == "invalid_choice"
-    assert explicit.score == 1.0
+
+    def score(prediction: str, gold_letter: str) -> float:
+        gold = GoldAnswerInfo(
+            question_id="mc",
+            answer=gold_letter,
+            metadata={"ground_truth": gold_letter},
+        )
+        return evaluator.evaluate(
+            question,
+            AnswerResult(question_id="mc", conversation_id="c", answer=prediction),
+            gold,
+        ).score
+
+    assert score("A", "A") == 1.0
+    assert score("(A)", "A") == 1.0
+    assert score("[B]", "B") == 1.0
+    assert score("c", "C") == 1.0
+    assert score("A.", "A") == 1.0
+    assert score("Apple", "A") == 0.0
+    assert score("Answer: B", "B") == 0.0
+    assert score("A is probably correct", "A") == 0.0
+    assert score("", "A") == 0.0
+    assert score("E", "A") == 0.0
 
 
 def test_judge_failure_is_judge_error_not_a_second_exception() -> None:
@@ -262,6 +271,89 @@ def test_client_and_server_latency_are_both_kept(tmp_path: Path) -> None:
     assert summary["efficiency_metrics"]["mean_server_retrieve_latency_ms"] == 10_000.0
 
 
+def test_http_server_latency_is_not_filled_with_client_time() -> None:
+    def missing(_url: str, _payload: dict, _timeout: float | None) -> dict:
+        return {"code": 200, "message": "ok", "data": {"formatted_memory": "x"}}
+
+    def zero(_url: str, _payload: dict, _timeout: float | None) -> dict:
+        return {"code": 200, "message": "ok", "data": None, "latency_ms": 0}
+
+    def present(_url: str, _payload: dict, _timeout: float | None) -> dict:
+        return {
+            "code": 200,
+            "message": "ok",
+            "data": {"formatted_memory": "x"},
+            "latency_ms": 35,
+        }
+
+    missing_client = HttpMemoryProvider("http://memory.local", transport=missing)
+    zero_client = HttpMemoryProvider("http://memory.local", transport=zero)
+    present_client = HttpMemoryProvider("http://memory.local", transport=present)
+    assert missing_client.retrieve(RetrieveRequest(isolation_key="iso", query="q")).latency_ms is None
+    assert zero_client.ingest(
+        IngestRequest(
+            isolation_key="iso",
+            session=Session(session_id="s", turns=[Turn("t", "Alice", "hi")]),
+        )
+    ).latency_ms == 0.0
+    assert present_client.retrieve(RetrieveRequest(isolation_key="iso", query="q")).latency_ms == 35.0
+
+
+def test_breakdown_uses_the_same_score_denominator(tmp_path: Path) -> None:
+    from memory_benchmark.core import MetricResult
+    from memory_benchmark.runners.evaluation import calculate_score_statistics
+
+    class Scripted:
+        metric_name = "llm_judge"
+
+        def evaluate(self, question, answer, gold):
+            verdict = {"q-ok": "CORRECT", "q-skip": "UNDECIDABLE"}[question.question_id]
+            return MetricResult(
+                metric_name="llm_judge",
+                score=1.0 if verdict == "CORRECT" else 0.0,
+                is_correct=True if verdict == "CORRECT" else None,
+                details={"verdict": verdict, "exclude_from_scorable_mean": verdict == "UNDECIDABLE"},
+            )
+
+    run_ctx = _run(tmp_path, MockMemoryProvider(), run_id="score-caliber")
+    pred_path = run_ctx.run_dir / "artifacts" / "method_predictions.jsonl"
+    kept = [row for row in read_jsonl(pred_path) if row["question_id"] == "q1"]
+    kept[0]["question_id"] = "q-ok"
+    pred_path.write_text(json.dumps(kept[0]) + "\n", encoding="utf-8")
+    public_path = run_ctx.run_dir / "artifacts" / "public_questions.jsonl"
+    private_path = run_ctx.run_dir / "artifacts" / "evaluator_private_labels.jsonl"
+    public = read_jsonl(public_path)
+    private = read_jsonl(private_path)
+    public[0]["question_id"] = "q-ok"
+    public[1]["question_id"] = "q-skip"
+    public[0]["capability"] = "fact_recall"
+    public[1]["capability"] = "fact_recall"
+    private[0]["question_id"] = "q-ok"
+    private[1]["question_id"] = "q-skip"
+    public_path.write_text("".join(json.dumps(row) + "\n" for row in public), encoding="utf-8")
+    private_path.write_text("".join(json.dumps(row) + "\n" for row in private), encoding="utf-8")
+    # q-skip has no prediction, so it is a missing prediction, not the judge's UNDECIDABLE.
+    # Put both judged questions in the prediction file and add the verdict via the evaluator.
+    rows = []
+    for qid, answer in (("q-ok", "Mango"), ("q-skip", "maybe")):
+        rows.append({"question_id": qid, "conversation_id": "conv-1", "answer": answer, "metadata": {}})
+    pred_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    summary = run_artifact_evaluation(run_ctx.run_dir, Scripted(), expected_benchmark="locomo")
+    saved = json.loads((run_ctx.run_dir / "summaries" / "summary.llm_judge.json").read_text())
+    assert summary.provisional is True
+    assert summary.undecidable_count == 1
+    assert summary.mean_score == 1.0
+    group = saved["capability_breakdown"][0]
+    assert group["overall_score"] == saved["mean_score"]
+    assert group["scored_questions"] == saved["scored_questions"]
+    stats = calculate_score_statistics(
+        read_jsonl(run_ctx.run_dir / "artifacts" / "answer_scores.llm_judge.jsonl")
+    )
+    assert stats["overall_score"] == summary.mean_score
+    assert stats["undecidable_count"] == 1
+
+
 def test_query_reuses_ingest_run_and_still_retrieves(tmp_path: Path) -> None:
     calls = {"retrieve": 0}
 
@@ -286,7 +378,7 @@ def test_query_reuses_ingest_run_and_still_retrieves(tmp_path: Path) -> None:
         _dataset(),
         provider,
         run_ctx,
-        policy=PredictionRunPolicy(skip_retrieval=True, resume=True),
+        policy=PredictionRunPolicy(skip_retrieval=True),
         answer_reader=FrameworkAnswerReader(client=FakeAnswerLLMClient("Mango")),
     )
     assert calls["retrieve"] == 0
@@ -294,34 +386,8 @@ def test_query_reuses_ingest_run_and_still_retrieves(tmp_path: Path) -> None:
         _dataset(),
         provider,
         run_ctx,
-        policy=PredictionRunPolicy(skip_ingest=True, resume=True),
+        policy=PredictionRunPolicy(skip_ingest=True),
         answer_reader=FrameworkAnswerReader(client=FakeAnswerLLMClient("Mango")),
     )
     assert calls["retrieve"] == 2
-    _prepare_run_directory(tmp_path / "outputs", "exp_locomo_01", resume=False, force=False, allow_existing=True)
-
-
-def test_resume_skips_completed_conversation(tmp_path: Path) -> None:
-    calls = {"ingest": 0}
-
-    class Counting(MemoryProvider):
-        def ingest(self, request: IngestRequest) -> Result[None]:
-            calls["ingest"] += 1
-            return Result.ok(None, latency_ms=1.0)
-
-        def retrieve(self, request: RetrieveRequest) -> Result[RetrievePayload]:
-            return Result.ok(RetrievePayload(formatted_memory="Mango"), latency_ms=1.0)
-
-    provider = Counting()
-    run_ctx = _run(tmp_path, provider)
-    assert calls["ingest"] == 1
-    run_predictions(
-        _dataset(),
-        provider,
-        run_ctx,
-        policy=PredictionRunPolicy(resume=True),
-        answer_reader=FrameworkAnswerReader(client=FakeAnswerLLMClient("Mango")),
-    )
-    assert calls["ingest"] == 1
-    progress = read_jsonl(run_ctx.run_dir / "checkpoints" / "conversation_progress.jsonl")
-    assert progress[-1]["status"] == "completed"
+    _prepare_run_directory(tmp_path / "outputs", "exp_locomo_01", allow_existing=True)

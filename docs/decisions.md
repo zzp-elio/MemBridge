@@ -458,6 +458,20 @@
   5. 每次 ingest 附带 `idempotency_key = {isolation_key}:{session_id}`。Mock 对同一键不重复写入。外部服务不识别该键时，重复 POST 仍可能双写；
   6. 不新增第三个 `MemoryProvider` 方法，因此不做 `DELETE /namespace`。默认 HTTP 超时保持 1800 秒，只增加 `--timeout-seconds`。
 
+---
+
+## ADR-031：第一版不做客户端断点恢复，分数口径只留一套
+
+- **背景**：
+  1. `--resume` 试图在客户端恢复整次实验，而 Memory Server 的持久化并不能告诉评测端哪些题已经答完；
+  2. `--force` 不删除目录，但会放行后续覆盖，历史产物不再是只读记录；
+  3. `HttpMemoryProvider` 在服务端没给 `latency_ms`，或给了 0 时，用客户端耗时填进同一个字段；
+  4. 总分排除了 `UNDECIDABLE` 和 `JUDGE_ERROR`，分类均分仍把记录上的 0 分算进去。
+- **决策**：
+  1. 删除 `--resume` 和 `--force`。目录非空就报错。中断后的实验留在原地，下一次用新的 `run_id`。`query` 仍可进入同一次 `ingest` 的目录；
+  2. `Result.latency_ms` 只表示服务端自报值。没有就是 `None`，`0` 保持 `0`。客户端墙钟单独记录；
+  3. `calculate_score_statistics` 同时服务总分、category 和 capability。缺失预测记 0。`UNDECIDABLE` 与 `JUDGE_ERROR` 不进入自动均分。任一出现则 `provisional=true`。
+
 
 
 

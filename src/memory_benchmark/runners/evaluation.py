@@ -49,6 +49,10 @@ class EvaluationRunSummary:
     scorable_mean_score: float | None = None
     human_review_count: int = 0
     judge_error_count: int = 0
+    undecidable_count: int = 0
+    scored_questions: int = 0
+    scoring_coverage: float | None = None
+    provisional: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -214,40 +218,33 @@ def run_artifact_evaluation(
 
     score_path = paths.metric_scores_path(resolved_metric_name)
     summary_path = paths.metric_summary_path(resolved_metric_name)
-    total_questions = len(score_records)
-    missing_questions = len(missing_question_ids)
-    human_review_count = sum(1 for record in score_records if _needs_human_review(record))
-    judge_error_count = sum(1 for record in score_records if _is_judge_error(record))
-    scorable_records = [record for record in score_records if not _excluded_from_mean(record)]
-    decided_records = [
-        record
-        for record in scorable_records
-        if (record.get("details") or {}).get("status") != "missing_prediction"
-    ]
-    mean_score = _mean_score(scorable_records)
-    conditional_mean_score = _mean_score(decided_records)
-    completion_rate = (
-        (total_questions - missing_questions) / total_questions if total_questions else None
-    )
-    correct_count = (
-        sum(1 for val in correct_values if val) if correct_values else None
-    )
+    stats = calculate_score_statistics(score_records)
+    correct_count = stats["correct_count"]
 
     summary = EvaluationRunSummary(
         run_id=run_id,
         benchmark_name=benchmark_name,
         metric_name=resolved_metric_name,
-        total_questions=total_questions,
-        mean_score=mean_score,
+        total_questions=int(stats["total_questions"]),
+        mean_score=stats["overall_score"],
         correct_count=correct_count,
         score_path=str(score_path.resolve()),
         summary_path=str(summary_path.resolve()),
-        missing_questions=missing_questions,
-        completion_rate=completion_rate,
-        conditional_mean_score=conditional_mean_score,
-        scorable_mean_score=conditional_mean_score,
-        human_review_count=human_review_count,
-        judge_error_count=judge_error_count,
+        missing_questions=int(stats["missing_prediction_count"]),
+        completion_rate=(
+            (int(stats["total_questions"]) - int(stats["missing_prediction_count"]))
+            / int(stats["total_questions"])
+            if stats["total_questions"]
+            else None
+        ),
+        conditional_mean_score=stats["conditional_score"],
+        scorable_mean_score=stats["conditional_score"],
+        human_review_count=int(stats["undecidable_count"]) + int(stats["judge_error_count"]),
+        judge_error_count=int(stats["judge_error_count"]),
+        undecidable_count=int(stats["undecidable_count"]),
+        scored_questions=int(stats["scored_questions"]),
+        scoring_coverage=stats["scoring_coverage"],
+        provisional=bool(stats["provisional"]),
     )
     summary_dict = summary.to_dict()
     if categories:
@@ -262,6 +259,66 @@ def run_artifact_evaluation(
     atomic_write_jsonl(score_path, score_records)
     atomic_write_json(summary_path, summary_dict)
     return summary
+
+
+def calculate_score_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """全局、category、capability 共用的计分口径。
+
+    缺失预测记 0 并进入 overall。UNDECIDABLE 与 JUDGE_ERROR 不进入自动均分。
+    """
+    missing: list[dict[str, Any]] = []
+    undecidable: list[dict[str, Any]] = []
+    judge_errors: list[dict[str, Any]] = []
+    decided: list[dict[str, Any]] = []
+    for record in records:
+        details = record.get("details") if isinstance(record.get("details"), dict) else {}
+        verdict = details.get("verdict")
+        if details.get("status") == "missing_prediction":
+            missing.append(record)
+        elif verdict == "JUDGE_ERROR":
+            judge_errors.append(record)
+        elif verdict == "UNDECIDABLE":
+            undecidable.append(record)
+        else:
+            decided.append(record)
+
+    overall_pool = decided + missing
+    total = len(records)
+    scored = len(overall_pool)
+
+    def _mean(pool: list[dict[str, Any]]) -> float | None:
+        if not pool:
+            return None
+        return sum(float(item["score"]) for item in pool) / len(pool)
+
+    return {
+        "total_questions": total,
+        "correct_count": (
+            sum(1 for item in decided if item.get("is_correct") is True) if decided else None
+        ),
+        "partial_count": sum(
+            1
+            for item in decided
+            if isinstance(item.get("details"), dict) and item["details"].get("verdict") == "PARTIAL"
+        ),
+        "wrong_count": sum(
+            1
+            for item in decided
+            if item.get("is_correct") is False
+            and not (
+                isinstance(item.get("details"), dict)
+                and item["details"].get("verdict") == "PARTIAL"
+            )
+        ),
+        "missing_prediction_count": len(missing),
+        "undecidable_count": len(undecidable),
+        "judge_error_count": len(judge_errors),
+        "scored_questions": scored,
+        "scoring_coverage": (scored / total) if total else None,
+        "overall_score": _mean(overall_pool),
+        "conditional_score": _mean(decided),
+        "provisional": bool(undecidable or judge_errors),
+    }
 
 
 def _excluded_from_mean(record: dict[str, Any]) -> bool:
@@ -456,19 +513,13 @@ def _build_category_breakdown(
     breakdown: list[dict[str, Any]] = []
     for cat in sorted(by_category):
         records = by_category[cat]
-        count = len(records)
-        cat_sum = sum(float(r["score"]) for r in records)
-        correct_vals = [
-            r["is_correct"] for r in records if r["is_correct"] is not None
-        ]
+        stats = calculate_score_statistics(records)
         breakdown.append(
             {
                 "category": cat,
-                "question_count": count,
-                "mean_score": cat_sum / count if count else 0.0,
-                "correct_count": (
-                    sum(1 for v in correct_vals if v) if correct_vals else None
-                ),
+                "question_count": stats["total_questions"],
+                "mean_score": stats["overall_score"],
+                **_public_score_fields(stats),
             }
         )
     return breakdown
@@ -487,23 +538,7 @@ def _build_capability_breakdown(
     breakdown: list[dict[str, Any]] = []
     for cap_key in sorted(by_cap):
         records = by_cap[cap_key]
-        count = len(records)
-        cap_sum = sum(float(r["score"]) for r in records)
-        correct_vals = [
-            r["is_correct"] for r in records if r["is_correct"] is not None
-        ]
-        human_review_count = sum(
-            1
-            for r in records
-            if isinstance(r.get("details"), dict)
-            and (
-                r["details"].get("human_review_required") is True
-                or r["details"].get("needs_human_review") is True
-                or r["details"].get("verdict") == "UNDECIDABLE"
-                or r["details"].get("judgment") == "UNDECIDABLE"
-            )
-        )
-
+        stats = calculate_score_statistics(records)
         label_zh = cap_key
         layer = "Unknown"
         try:
@@ -518,15 +553,29 @@ def _build_capability_breakdown(
                 "capability": cap_key,
                 "label_zh": label_zh,
                 "layer": layer,
-                "question_count": count,
-                "mean_score": round(cap_sum / count, 4) if count else 0.0,
-                "correct_count": (
-                    sum(1 for v in correct_vals if v) if correct_vals else None
-                ),
-                "human_review_count": human_review_count,
+                "question_count": stats["total_questions"],
+                "mean_score": stats["overall_score"],
+                "human_review_count": stats["undecidable_count"] + stats["judge_error_count"],
+                **_public_score_fields(stats),
             }
         )
     return breakdown
+
+
+def _public_score_fields(stats: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "correct_count": stats["correct_count"],
+        "partial_count": stats["partial_count"],
+        "wrong_count": stats["wrong_count"],
+        "missing_prediction_count": stats["missing_prediction_count"],
+        "undecidable_count": stats["undecidable_count"],
+        "judge_error_count": stats["judge_error_count"],
+        "scored_questions": stats["scored_questions"],
+        "scoring_coverage": stats["scoring_coverage"],
+        "overall_score": stats["overall_score"],
+        "conditional_score": stats["conditional_score"],
+        "provisional": stats["provisional"],
+    }
 
 
 def _read_json_object(path: Path, *, payload_name: str) -> dict[str, Any]:
@@ -605,4 +654,4 @@ def _ensure_dict(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
-__all__ = ["EvaluationRunSummary", "run_artifact_evaluation"]
+__all__ = ["EvaluationRunSummary", "calculate_score_statistics", "run_artifact_evaluation"]

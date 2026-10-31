@@ -23,7 +23,12 @@ class DatasetNotFoundError(MemoryBenchmarkError):
             None。异常消息会包含 benchmark 和路径，方便 debug。
         """
 
-        super().__init__(f"{benchmark} expected dataset path missing: {relative_path}")
+        super().__init__(
+            f"Dataset files not found for {benchmark}.\n"
+            f"Expected path: ./{relative_path}\n"
+            "Download benchmark data into the project data/ directory from "
+            "https://huggingface.co/datasets/BuptZZP/agentmemorybench-data"
+        )
         self.benchmark = benchmark
         self.relative_path = relative_path
 
