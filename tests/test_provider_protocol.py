@@ -166,3 +166,53 @@ def test_http_memory_provider_transport_and_error_handling() -> None:
     assert ret_res.data is not None
     assert ret_res.data.formatted_memory == "Server memory: Alice moved to Seattle."
     assert ret_res.latency_ms == 42.0
+
+
+def test_default_urllib_transport_override_false_code_200_on_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证 HTTP 状态码为 500 时，即使 JSON body 含有 code: 200，也坚决返回 500 失败。"""
+    import io
+    import urllib.error
+    from memory_benchmark.core.provider_protocol import _default_urllib_transport
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> Any:
+        # 模拟外部服务抛出 HTTP 500，但 body 里是个假 200
+        fp = io.BytesIO(b'{"code": 200, "message": "misreported ok", "data": null}')
+        raise urllib.error.HTTPError(
+            url="http://memory.local/ingest",
+            code=500,
+            msg="Internal Server Error",
+            hdrs={},  # type: ignore[arg-type]
+            fp=fp,
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    res = _default_urllib_transport("http://memory.local/ingest", {"isolation_key": "k"}, timeout_seconds=5.0)
+    assert res["code"] == 500
+    assert "code" in res
+
+
+def test_default_urllib_transport_retries_on_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证当远端返回 429 限流时，transport 会进行指数退避重试。"""
+    import io
+    import urllib.error
+    from memory_benchmark.core.provider_protocol import _default_urllib_transport
+
+    attempts = 0
+
+    def fake_urlopen(req: Any, timeout: float | None = None) -> Any:
+        nonlocal attempts
+        attempts += 1
+        fp = io.BytesIO(b'{"code": 429, "message": "rate limited"}')
+        raise urllib.error.HTTPError(
+            url="http://memory.local/ingest",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={},  # type: ignore[arg-type]
+            fp=fp,
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("time.sleep", lambda s: None)  # 加快测试
+    res = _default_urllib_transport("http://memory.local/ingest", {"isolation_key": "k"}, timeout_seconds=5.0, max_retries=3)
+    assert attempts == 3
+    assert res["code"] == 429

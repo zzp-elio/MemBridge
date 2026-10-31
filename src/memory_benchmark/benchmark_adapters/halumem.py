@@ -297,6 +297,7 @@ def _questions_from_raw(
                 text=question_text,
                 category=question_type,
                 capability=capability,
+                after_session_id=session_id,
                 metadata={},
             )
         )

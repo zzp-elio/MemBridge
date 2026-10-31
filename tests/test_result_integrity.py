@@ -391,3 +391,87 @@ def test_query_reuses_ingest_run_and_still_retrieves(tmp_path: Path) -> None:
     )
     assert calls["retrieve"] == 2
     _prepare_run_directory(tmp_path / "outputs", "exp_locomo_01", allow_existing=True)
+
+
+def test_interleaved_chronological_session_execution_prevents_leakage(tmp_path: Path) -> None:
+    """验证带有 after_session_id 的流式因果评测（如 HaluMem）中，早期问题绝不可能检索到未来 Session。"""
+    seen_history_at_query: dict[str, list[str]] = {}
+
+    class InterleavedTrackingProvider(MemoryProvider):
+        def __init__(self) -> None:
+            self.stored_turns: list[str] = []
+
+        def ingest(self, request: IngestRequest) -> Result[None]:
+            for turn in request.session.turns:
+                self.stored_turns.append(turn.content)
+            return Result.ok(None, latency_ms=10.0)
+
+        def retrieve(self, request: RetrieveRequest) -> Result[RetrievePayload]:
+            qid = request.question_id or "unknown"
+            # 记录当前提问时刻，记忆库里真实存在的全部文本
+            seen_history_at_query[qid] = list(self.stored_turns)
+            return Result.ok(
+                RetrievePayload(formatted_memory="; ".join(self.stored_turns)),
+                latency_ms=5.0,
+            )
+
+    interleaved_conv = Conversation(
+        conversation_id="user-halumem-1",
+        sessions=[
+            Session(
+                session_id="s1",
+                turns=[Turn("t1", "User", "I currently work in Beijing.")],
+            ),
+            Session(
+                session_id="s2",
+                turns=[Turn("t2", "User", "I just moved to Shanghai.")],
+            ),
+        ],
+        questions=[
+            Question(
+                question_id="q-at-s1",
+                conversation_id="user-halumem-1",
+                text="Where do I work?",
+                after_session_id="s1",  # 明确绑定在 Session 1 之后立即提问
+            ),
+            Question(
+                question_id="q-at-s2",
+                conversation_id="user-halumem-1",
+                text="Where do I live now?",
+                after_session_id="s2",  # 绑定在 Session 2 之后提问
+            ),
+        ],
+        gold_answers={
+            "q-at-s1": GoldAnswerInfo("q-at-s1", "Beijing"),
+            "q-at-s2": GoldAnswerInfo("q-at-s2", "Shanghai"),
+        },
+    )
+
+    interleaved_dataset = Dataset(
+        dataset_name="halumem",
+        conversations=[interleaved_conv],
+    )
+
+    run_ctx = RunContext.create(
+        run_id="exp_interleaved_01",
+        benchmark_name="halumem",
+        method_name="http",
+        model_name="fake-model",
+        output_root=tmp_path / "outputs",
+    )
+
+    provider = InterleavedTrackingProvider()
+    run_predictions(
+        interleaved_dataset,
+        provider,
+        run_ctx,
+        answer_reader=FrameworkAnswerReader(client=FakeAnswerLLMClient("answer")),
+    )
+
+    # 关键断言：问 q-at-s1 时，记忆库里绝对只有 s1 的内容，物理阻断未来 s2 的信息！
+    assert seen_history_at_query["q-at-s1"] == ["I currently work in Beijing."]
+    # 问 q-at-s2 时，记忆库里才有了 s1 和 s2 的内容
+    assert seen_history_at_query["q-at-s2"] == [
+        "I currently work in Beijing.",
+        "I just moved to Shanghai.",
+    ]

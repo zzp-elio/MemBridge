@@ -82,6 +82,7 @@ class Question:
     category: str | None = None
     capability: UnifiedCapability | str | None = None
     options: dict[str, str] | None = None
+    after_session_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property

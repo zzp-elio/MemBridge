@@ -153,17 +153,8 @@ def _execute_single_conversation(
     effective_run_id = isolation_prefix or run_id
     isolation_key = default_isolation_key(effective_run_id, conv_id)
     try:
-        if skip_ingest:
-            conv_ingest_latencies = [0.0]
-            server_ingest_latencies: list[float | None] = [None]
-        else:
-            conv_ingest_latencies, server_ingest_latencies = _ingest_conversation(
-                conversation=conversation,
-                isolation_key=isolation_key,
-                provider=provider,
-                dataset_was_truncated=dataset_was_truncated,
-            )
-
+        conv_ingest_latencies: list[float] = []
+        server_ingest_latencies: list[float | None] = []
         pred_records: list[dict[str, Any]] = []
         prompt_records: list[dict[str, Any]] = []
         ret_latencies: list[float] = []
@@ -171,8 +162,20 @@ def _execute_single_conversation(
         ctx_tokens_list: list[int] = []
         token_methods: list[str] = []
 
-        if not skip_retrieval:
-            for question in questions:
+        # 整理 questions：按 after_session_id 分组
+        session_questions: dict[str, list[Question]] = {}
+        trailing_questions: list[Question] = []
+        valid_session_ids = {s.session_id for s in conversation.sessions}
+        for q in questions:
+            if q.after_session_id and q.after_session_id in valid_session_ids:
+                session_questions.setdefault(q.after_session_id, []).append(q)
+            else:
+                trailing_questions.append(q)
+
+        def _handle_questions(q_list: list[Question]) -> None:
+            if skip_retrieval:
+                return
+            for question in q_list:
                 (
                     pred_record,
                     prompt_record,
@@ -195,6 +198,38 @@ def _execute_single_conversation(
                 server_ret_latencies.append(server_ret_latency_ms)
                 ctx_tokens_list.append(ctx_tokens)
                 token_methods.append(token_method)
+
+        num_sessions = len(conversation.sessions)
+        if not skip_ingest:
+            for s_idx, session in enumerate(conversation.sessions):
+                is_last_session = (s_idx == num_sessions - 1) and not dataset_was_truncated
+                request = IngestRequest(
+                    isolation_key=isolation_key,
+                    session=session,
+                    metadata={"is_last_session": is_last_session},
+                    idempotency_key=f"{isolation_key}:{session.session_id}",
+                )
+                start = time.perf_counter()
+                result = provider.ingest(request)
+                wall_ms = (time.perf_counter() - start) * 1000.0
+                if not result.is_success:
+                    raise RuntimeError(
+                        f"Ingest failed with code={result.code} for session '{session.session_id}': {result.message}"
+                    )
+                conv_ingest_latencies.append(wall_ms)
+                server_ingest_latencies.append(result.latency_ms)
+
+                # 若当前 session 存在挂载题目（流式穿插模式），立即执行检索答题
+                if session.session_id in session_questions:
+                    _handle_questions(session_questions[session.session_id])
+        else:
+            conv_ingest_latencies = [0.0]
+            server_ingest_latencies = [None]
+            for s_qs in session_questions.values():
+                trailing_questions.extend(s_qs)
+
+        # 执行尾部未绑定具体 session 的全局题目（LoCoMo、LongMemEval、MemBench 等）
+        _handle_questions(trailing_questions)
 
         status_entry = {
             "status": "completed",
@@ -707,6 +742,7 @@ def _write_question_artifacts(
                         else question.capability
                     ),
                     "options": question.options,
+                    "after_session_id": question.after_session_id,
                     "metadata": dict(question.metadata),
                 }
             )

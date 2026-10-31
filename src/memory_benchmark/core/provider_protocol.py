@@ -243,11 +243,17 @@ def _default_urllib_transport(
                 status_code = resp.status
                 break
         except urllib.error.HTTPError as exc:
+            if exc.code in (429, 502, 503, 504) and attempt < max_retries - 1:
+                time.sleep(0.5 * (2**attempt))
+                continue
             error_text = exc.read().decode("utf-8", errors="replace")
             try:
                 parsed_err = json.loads(error_text)
                 if isinstance(parsed_err, dict):
-                    parsed_err.setdefault("code", exc.code)
+                    err_code = int(parsed_err.get("code") or exc.code)
+                    if err_code < 400:
+                        err_code = int(exc.code)
+                    parsed_err["code"] = err_code
                     parsed_err.setdefault("message", str(exc.reason))
                     return parsed_err
             except json.JSONDecodeError:

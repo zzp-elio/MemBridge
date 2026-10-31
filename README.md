@@ -97,6 +97,7 @@ Delivers memories at the granularity of a **Session** (a single interactive epis
         *Recommendation*: Memory systems can directly use `speaker` as entity subjects or source tags.
       - `turn_time` (`str | null`): Specific turn timestamp (when available in BEAM/HaluMem, otherwise `null`);
       - `content` (`str`): Utterance text (multimodal image descriptions are standardized as inline text descriptions);
+  - `idempotency_key` (`str`, optional): Unique deduplication key (`{isolation_key}:{session_id}`). Also passed via standard HTTP header `Idempotency-Key` for safe retries;
   - `metadata` (`dict`): Scheduling metadata, such as `{"is_last_session": true}` marking conversation completion.
 
 > **Temporal Fallback Strategy**:

@@ -97,6 +97,7 @@
         *建议*：被测系统在抽取知识实体时，可直接以 `speaker` 作为主语/来源标签。
       - `turn_time` (`str | null`)：单轮发言具体时间戳（部分基准如 BEAM/HaluMem 细化到了单轮，若无则为 `null`）；
       - `content` (`str`)：发言文本内容（多模态视觉描述已标准化内联为文本描述）；
+  - `idempotency_key` (`str`，可选)：请求幂等去重键（`{isolation_key}:{session_id}`），同时通过 HTTP 请求头 `Idempotency-Key` 下发，保障重试安全性；
   - `metadata` (`dict`)：调度元数据，如 `{"is_last_session": true}` 告知会话收口。
 
 > **时间层级降级策略（Temporal Fallback）**：
