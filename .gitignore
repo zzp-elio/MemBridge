@@ -13,10 +13,6 @@
 !src/**
 !tests/
 !tests/**
-!docs/
-!docs/**
-!STATE.md
-!AGENTS.md
 !.github/
 !.github/**
 

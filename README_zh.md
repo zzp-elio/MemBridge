@@ -58,6 +58,7 @@
 │   ├── storage/                        # 评测实验产物管理 (JSON Lines 读写与原子落地)
 │   ├── utils/                          # 通用工具 (线程安全运行日志记录器等)
 │   └── __main__.py                     # 极简 CLI 命令行入口 (run / ingest / query / eval)
+├── tests/                              # 契约测试，由 CI 运行
 ├── pyproject.toml                      # 项目元数据与评测必要依赖规范
 ├── uv.lock                             # 确定性依赖版本锁定文件
 ├── .env.example                        # 环境变量模板 (API_KEY / BASE_URL / MODEL_NAME)
@@ -266,15 +267,7 @@ BASE_URL=https://api.openai.com/v1
 MODEL_NAME=gpt-4o-mini
 ```
 
-### 3. 运行自动化契约测试
-
-在运行真实实验前，可运行测试套件验证代码与文档防漂移契约：
-
-```bash
-uv run pytest -q
-```
-
-### Benchmark 数据集
+### 3. Benchmark 数据集
 
 原始评测数据不在这个 Git 仓库里。请下载到项目根目录的 `data/`。
 

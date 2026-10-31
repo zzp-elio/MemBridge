@@ -58,6 +58,7 @@ MemBridge provides three cohesive evaluators: **Exact String Match (`ExactMatch`
 │   ├── storage/                        # Experiment artifact persistence (atomic JSON Lines I/O)
 │   ├── utils/                          # Common utilities (thread-safe run loggers, etc.)
 │   └── __main__.py                     # Minimal CLI entrypoints (run, ingest, query, eval)
+├── tests/                              # Contract tests, run in CI
 ├── pyproject.toml                      # Project metadata & evaluation dependencies
 ├── uv.lock                             # Deterministic dependency lockfile
 ├── .env.example                        # Environment variable template (API_KEY, BASE_URL, MODEL_NAME)
@@ -266,15 +267,7 @@ BASE_URL=https://api.openai.com/v1
 MODEL_NAME=gpt-4o-mini
 ```
 
-### 3. Run Automated Contract Tests
-
-Verify system integrity and documentation drift contracts before running experiments:
-
-```bash
-uv run pytest -q
-```
-
-### Benchmark data
+### 3. Benchmark data
 
 Benchmark files are not tracked in this Git repository. Download them into `data/` at the project root.
 

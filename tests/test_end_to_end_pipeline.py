@@ -276,23 +276,18 @@ def test_spring_boot_style_yaml_config_and_evaluators() -> None:
 
 
 def test_documentation_links_and_paths_never_drift() -> None:
-    """硬门禁：防止重构代码后忘记同步架构文档（自动校验核心 Markdown 链接有效性与架构文档覆盖度）。"""
+    """公开 README 里的相对链接和代码路径必须在仓库中真实存在。"""
     import re
 
     repo_root = Path(__file__).resolve().parents[1]
-    core_docs = [
-        repo_root / "AGENTS.md",
-        repo_root / "STATE.md",
+    public_docs = [
         repo_root / "README.md",
         repo_root / "README_zh.md",
-        repo_root / "docs" / "architecture.md",
-        repo_root / "docs" / "decisions.md",
     ]
-    # 匹配形如 [`label`](path) 或 [label](path) 的真实 Markdown 链接（排除 `Result[T](code, ...)` 这类函数签名）
     link_pattern = re.compile(r"(?<![A-Za-z0-9_])\[[^\]]+\]\(([^)#\s]+)(?:#[^)]*)?\)")
 
-    for doc_path in core_docs:
-        assert doc_path.exists(), f"Missing core document: {doc_path}"
+    for doc_path in public_docs:
+        assert doc_path.exists(), f"Missing public document: {doc_path}"
         content = doc_path.read_text(encoding="utf-8")
         for match in link_pattern.finditer(content):
             raw_target = match.group(1).strip()
@@ -304,23 +299,14 @@ def test_documentation_links_and_paths_never_drift() -> None:
                 f"(resolved to non-existent {resolved})"
             )
 
-    # Active 架构文档（README.md 与 docs/architecture.md）中出现的 `src/memory_benchmark/...` 路径必须真实存在
     code_path_pattern = re.compile(r"`((?:src/memory_benchmark|configs)/[A-Za-z0-9_./-]+)`")
-    for active_doc in (
-        repo_root / "README.md",
-        repo_root / "README_zh.md",
-        repo_root / "docs" / "architecture.md",
-    ):
+    for active_doc in public_docs:
         text = active_doc.read_text(encoding="utf-8")
         for match in code_path_pattern.finditer(text):
             rel_path = match.group(1)
             assert (repo_root / rel_path).exists(), (
                 f"Stale code path `{rel_path}` in {active_doc.relative_to(repo_root)} does not exist on disk!"
             )
-
-    # AGENTS.md 与 STATE.md 基础存在性与非空校验（不卡死硬性行数）
-    assert len((repo_root / "AGENTS.md").read_text(encoding="utf-8").strip()) > 0
-    assert len((repo_root / "STATE.md").read_text(encoding="utf-8").strip()) > 0
 
 
 def test_retain_scored_cohort_drops_unmapped_questions() -> None:
