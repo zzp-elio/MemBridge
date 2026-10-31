@@ -48,6 +48,8 @@ MemBridge provides three cohesive evaluators: **Exact String Match (`ExactMatch`
 ```text
 ├── configs/
 │   └── application.yaml                # Unified configuration (LLM hyperparameters & dynamic prompt matrix)
+├── examples/
+│   └── memory_server.py                # Zero-dependency reference HTTP memory server (<100 lines)
 ├── assets/                             # Repository static assets & academic architecture diagram
 ├── src/memory_benchmark/               # Core middleware source code
 │   ├── benchmark_adapters/             # Benchmark loaders & 6-capability cohort filters (LoCoMo, LongMemEval, etc.)
@@ -326,6 +328,18 @@ All five primary benchmarks (`locomo`, `longmemeval`, `membench`, `halumem`, `BE
 ---
 
 ### 4. Running Evaluations
+
+#### ⚡ 30-Second Quickstart (Try MemBridge with Built-in Reference Server)
+
+You don't need any complex external framework or Docker setup to see MemBridge in action. Launch the zero-dependency reference memory server and run an instant evaluation:
+
+```bash
+# Terminal 1: Start the reference memory server (pure standard library, 0 dependencies)
+python examples/memory_server.py --port 8000
+
+# Terminal 2: Run an instant smoke evaluation against the server
+uv run membridge run --smoke --server-url http://127.0.0.1:8000
+```
 
 #### Option A: One-Click Fast Smoke Test (Verify Connectivity & Serialization in Seconds)
 

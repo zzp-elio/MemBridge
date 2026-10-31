@@ -216,3 +216,58 @@ def test_default_urllib_transport_retries_on_429(monkeypatch: pytest.MonkeyPatch
     res = _default_urllib_transport("http://memory.local/ingest", {"isolation_key": "k"}, timeout_seconds=5.0, max_retries=3)
     assert attempts == 3
     assert res["code"] == 429
+
+
+def test_examples_minimal_memory_server_real_http_socket_roundtrip() -> None:
+    """验证 examples/memory_server.py 能够作为真实的 HTTP 记忆服务响应 Ingest 与 Retrieve。"""
+    import threading
+    from http.server import ThreadingHTTPServer
+    import sys
+    from pathlib import Path
+    
+    # 动态导入 examples/memory_server.py
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "examples"))
+    try:
+        import memory_server
+        server = ThreadingHTTPServer(("127.0.0.1", 0), memory_server.MemoryServerHandler)
+        port = server.server_port
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        client = HttpMemoryProvider(base_url=f"http://127.0.0.1:{port}", timeout_seconds=5.0)
+
+        # 1. Ingest
+        sess = Session(
+            session_id="s1",
+            turns=[
+                Turn(turn_id="t1", speaker="User", content="My favorite color is green."),
+                Turn(turn_id="t2", speaker="Assistant", content="Green is a calming color."),
+            ],
+        )
+        ingest_res = client.ingest(
+            IngestRequest(
+                isolation_key="user-test-key",
+                session=sess,
+                idempotency_key="user-test-key:s1",
+            )
+        )
+        assert ingest_res.code == 200
+        assert ingest_res.is_success
+        assert ingest_res.latency_ms is not None
+
+        # 2. Retrieve
+        ret_res = client.retrieve(
+            RetrieveRequest(
+                isolation_key="user-test-key",
+                query="What color do I like?",
+            )
+        )
+        assert ret_res.code == 200
+        assert ret_res.is_success
+        assert ret_res.data is not None
+        assert "My favorite color is green." in ret_res.data.formatted_memory
+        assert ret_res.latency_ms is not None
+    finally:
+        server.shutdown()
+        server.server_close()
+        sys.path.pop(0)

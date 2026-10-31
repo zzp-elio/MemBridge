@@ -48,6 +48,8 @@
 ```text
 ├── configs/
 │   └── application.yaml                # 统一配置中心（LLM 客户端超参与动态 Prompt 矩阵）
+├── examples/
+│   └── memory_server.py                # 零依赖参考记忆服务端（<100 行，开箱即用）
 ├── assets/                             # 仓库静态资产与学术架构示意图
 ├── src/memory_benchmark/               # 评测中间层核心源码
 │   ├── benchmark_adapters/             # 5 大基准加载与 6 类题型过滤适配器 (LoCoMo / LongMemEval 等)
@@ -326,6 +328,18 @@ data/membench/Membenchdata/data2test/100k/
 ---
 
 ### 4. 运行评测实验
+
+#### ⚡ 30 秒极速上手体验（配合内置参考记忆服务）
+
+无需配置复杂的外部服务或 Docker 容器即可体验 MemBridge 的标准 C/S 评测：
+
+```bash
+# 终端 1: 启动参考记忆服务 (纯 Python 标准库，0 外部依赖)
+python examples/memory_server.py --port 8000
+
+# 终端 2: 启动一键极简冒烟评测
+uv run membridge run --smoke --server-url http://127.0.0.1:8000
+```
 
 #### 方式 A：一键极速冒烟探活（秒级验证外部服务连通性与接口对齐）
 
