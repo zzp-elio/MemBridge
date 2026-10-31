@@ -341,7 +341,7 @@ data/membench/Membenchdata/data2test/100k/
 uv run membridge run --smoke --server-url http://127.0.0.1:8002
 ```
 
-> **`--smoke` 的作用**：自动安全锁定为「1 个会话、1 个 Session、1 道考题」，在真实网络层仅触发 1 次 `POST /ingest` 与 1 次 `POST /retrieve`，秒级跑通全流程，避免长会话建库等待与 Token 浪费。
+> **`--smoke` 的作用**：自动安全锁定为「1 个隔离空间中的 1 个 Session，并且只有 1 个 Question」，在真实网络层仅触发 1 次 `POST /ingest` 与 1 次 `POST /retrieve`，秒级跑通全流程，避免长会话建库等待与 Token 浪费。
 
 #### 方式 B：全量生产端到端评测（默认全量数据）
 
@@ -389,7 +389,7 @@ MemBridge 采用 **子命令（Subcommand）流水线架构**，各阶段职责�
 | 参数 (Option) | 短选项 | 默认值 | 取值范围 / 示例 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `--benchmark` | `-b` | `locomo` | `locomo`, `longmemeval`, `halumem`, `beam`, `membench` | 目标评测基准数据集。 |
-| `--smoke` | - | `False` | 标志位（无需值） | **一键安全冒烟模式**：强制锁定为 1 个会话 + 1 个 Session + 1 道题，秒级完成全链路验证。**不传时默认 100% 全量评测**。 |
+| `--smoke` | - | `False` | 标志位（无需值） | **一键安全冒烟模式**：强制锁定为 1 个隔离空间中的 1 个 Session + 1 个 Question，秒级完成全链路验证。**不传时默认 100% 全量评测**。 |
 | `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | 被测 Memory Server 的真实 HTTP 根地址。 |
 | `--max-workers` | `-w` | `1` | 整数（如 `4`, `10`） | 会话级多线程并发 Worker 数。评测自动按原始索引确定性升序归并产物。 |
 | `--run-id` | - | 自动生成的唯一 ID | 字符串（如 `exp_locomo_01`） | 实验 ID。缺省为 `{benchmark}_{method}_{UTC时间}_{8位hex}`，产物在 `outputs/{run_id}/`。目录非空就报错，不覆盖。`query` 可以复用同一次 ingest 的 run_id。 |

@@ -341,7 +341,7 @@ After starting your Memory Server, run the smoke test to verify network routing 
 uv run membridge run --smoke --server-url http://127.0.0.1:8002
 ```
 
-> **What `--smoke` does**: Constrains execution to "1 conversation, 1 session, 1 question". Triggers exactly 1 `POST /ingest` and 1 `POST /retrieve`, verifying the end-to-end pipeline in seconds without token waste or indexing delays.
+> **What `--smoke` does**: Constrains execution to 1 session within 1 isolated namespace (`isolation_key`), with exactly 1 question. Triggers exactly 1 `POST /ingest` and 1 `POST /retrieve`, verifying the end-to-end pipeline in seconds without token waste or indexing delays.
 
 #### Option B: Full Production Evaluation (Default Full Dataset)
 
@@ -389,7 +389,7 @@ Applicable to `run`, `ingest`, and `query` subcommands (`membridge [options]` de
 | Option | Short | Default | Choices / Example | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `--benchmark` | `-b` | `locomo` | `locomo`, `longmemeval`, `halumem`, `beam`, `membench` | Target benchmark dataset. |
-| `--smoke` | - | `False` | Flag | **One-click smoke mode**: Locks to 1 conversation, 1 session, 1 question for instant verification. Defaults to full evaluation when omitted. |
+| `--smoke` | - | `False` | Flag | **One-click smoke mode**: Locks to 1 session in 1 isolated namespace (`isolation_key`) with 1 question for instant verification. Defaults to full evaluation when omitted. |
 | `--server-url` | `-u` | `http://127.0.0.1:8002` | `http://127.0.0.1:8002` | HTTP base URL of the Memory Server under test. |
 | `--max-workers` | `-w` | `1` | Integer (e.g., `4`, `10`) | Number of concurrent conversation workers. Results are merged deterministically in ascending order. |
 | `--run-id` | - | Auto-generated unique id | String (e.g., `exp_locomo_01`) | Experiment id. Defaults to `{benchmark}_{method}_{utc-timestamp}_{8 hex}`. Artifacts are saved to `outputs/{run_id}/`. A non-empty directory is refused. `query` may reuse the ingest run id. |
