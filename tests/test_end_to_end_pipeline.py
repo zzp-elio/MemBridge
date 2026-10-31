@@ -715,7 +715,8 @@ def test_lightmem_server_protocol_integration() -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     lightmem_docker_dir = repo_root / "third_party" / "methods" / "LightMem" / "docker"
-    assert lightmem_docker_dir.is_dir()
+    if not lightmem_docker_dir.is_dir():
+        pytest.skip("LightMem docker server is not part of this checkout")
     if str(lightmem_docker_dir) not in sys.path:
         sys.path.insert(0, str(lightmem_docker_dir))
 
@@ -1152,23 +1153,55 @@ def test_subcommand_pipeline_and_smoke(tmp_path: Path) -> None:
     assert args_eval.run_dir == str(tmp_path)
     assert args_eval.metrics == "f1,exact_match"
 
-    # 3. 验证端到端各子命令调度退出码为 0。query 必须复用 ingest 的 run_id。
-    # 3.1 ingest 阶段
+    # 3. 用临时数据集跑通子命令，不依赖本机才有的 data/locomo。
+    import json
+
+    sample_root = tmp_path / "project"
+    sample_file = sample_root / "data" / "locomo" / "locomo10.json"
+    sample_file.parent.mkdir(parents=True)
+    sample_file.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-cli-1",
+                    "conversation": {
+                        "speaker_a": "Alice",
+                        "speaker_b": "Bob",
+                        "session_1_date_time": "2026-05-01 10:00",
+                        "session_1": [
+                            {"speaker": "Alice", "dia_id": "D1:1", "text": "I live in Paris."},
+                            {"speaker": "Bob", "dia_id": "D1:2", "text": "Paris is wonderful!"},
+                        ],
+                    },
+                    "qa": [
+                        {
+                            "question": "Where does Alice live?",
+                            "answer": "Paris",
+                            "category": 1,
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    root = str(sample_root)
     ret_ingest = main([
         "ingest", "--smoke", "-b", "locomo", "-m", "mock",
-        "--run-id", "pipeline_smoke", "--force", "--project-root", ".",
+        "--run-id", "pipeline_smoke", "--force", "--project-root", root,
     ])
     assert ret_ingest == 0
 
-    # 3.2 query 阶段
     ret_query = main([
         "query", "--smoke", "-b", "locomo", "-m", "mock", "--mock-llm",
-        "--run-id", "pipeline_smoke", "--project-root", ".",
+        "--run-id", "pipeline_smoke", "--project-root", root,
     ])
     assert ret_query == 0
 
-    # 3.3 一键 run 阶段
-    ret_run = main(["run", "--smoke", "-b", "locomo", "-m", "mock", "--mock-llm", "--metrics", "f1", "--project-root", "."])
+    ret_run = main([
+        "run", "--smoke", "-b", "locomo", "-m", "mock", "--mock-llm",
+        "--metrics", "f1", "--project-root", root,
+    ])
     assert ret_run == 0
 
 
